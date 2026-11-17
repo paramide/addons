@@ -1,5 +1,6 @@
 local source_controls = {}
 local social_enemy_prediction = nil
+local social_resolver_snapshot = nil
 local ffi = require("ffi")
 local color4 = color4 or function(r,g,b,a) if type(r)=="table" then return color(r.r or r[1],r.g or r[2],r.b or r[3],r.a or r[4] or 255) end return color(r,g,b,a) end
 local function import_color(value)
@@ -91,6 +92,27 @@ local function finite_number(value)
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
 
+-- Correction runs fully automatic; values are fixed to the tuned optimum.
+local correction_preset = {
+    max_ticks = 8,
+    adaptive = {
+        ["Auto Speed Adjust"] = true,
+        ["Ping Compensation"] = true,
+        ["Smart Interp"] = true,
+        ["Movement Predict"] = true,
+        ["Crouch Predict"] = true,
+        ["Advanced Calculation"] = true
+    }
+}
+local function correction_value(key, default)
+    local value = correction_preset[key]
+    if finite_number(value) then return value end
+    return default
+end
+local function correction_adaptive(name)
+    return correction_preset.adaptive[name] == true
+end
+
 local shot_diagnostics = { entries = {}, sequence = 0, max_entries = 256 }
 local shot_diag_pending = {}
 local shot_diag_pending_sequence = 0
@@ -138,7 +160,14 @@ local function shot_diag_prediction(target)
         acceleration = shot_diag_number(prediction.acceleration),
         sample_dt = shot_diag_number(prediction.sample_dt),
         samples = shot_diag_number(prediction.samples),
+        history_samples = shot_diag_number(prediction.history_samples),
         ticks = shot_diag_number(prediction.ticks),
+        tick_fraction = shot_diag_number(prediction.tick_fraction),
+        lead_seconds = shot_diag_number(prediction.lead_seconds),
+        confidence = shot_diag_number(prediction.confidence),
+        speed = shot_diag_number(prediction.speed),
+        source = shot_diag_text(prediction.source, 24),
+        defensive = prediction.defensive == true,
         collision = prediction.collision == true
     }
 end
@@ -175,6 +204,10 @@ local function shot_diag_capture_fire(event)
     if fire.hitgroup ~= nil then
         fire.requested_hitgroup_id = fire.hitgroup
         fire.requested_hitgroup = requested_hitgroups[fire.hitgroup] or "unknown"
+    end
+    if type(social_resolver_snapshot) == "function" then
+        local snapshot_ok, snapshot = pcall(social_resolver_snapshot, target)
+        if snapshot_ok and type(snapshot) == "table" then fire.resolver = snapshot end
     end
     shot_diag_pending_sequence = shot_diag_pending_sequence + 1
     fire.pending_sequence = shot_diag_pending_sequence
@@ -276,8 +309,65 @@ local function shot_diag_record(event)
     entries[#entries + 1] = record
     while #entries > shot_diagnostics.max_entries do table.remove(entries, 1) end
 end
+local function shot_diag_escape(text)
+    return '"' .. tostring(text):gsub('[%c\\"]', function(ch)
+        if ch == '"' then return '\\"' end
+        if ch == "\\" then return "\\\\" end
+        if ch == "\n" then return "\\n" end
+        if ch == "\r" then return "\\r" end
+        if ch == "\t" then return "\\t" end
+        return string.format("\\u%04x", string.byte(ch))
+    end) .. '"'
+end
+local function shot_diag_encode(value, stack)
+    local kind = type(value)
+    if kind == "nil" then return "null" end
+    if kind == "boolean" then return value and "true" or "false" end
+    if kind == "number" then
+        if not finite_number(value) then return nil end
+        if value == math.floor(value) and math.abs(value) < 1e15 then
+            return string.format("%.0f", value)
+        end
+        return string.format("%.14g", value)
+    end
+    if kind == "string" then return shot_diag_escape(value) end
+    if kind ~= "table" then return nil end
+    stack = stack or {}
+    if stack[value] then return nil end
+    stack[value] = true
+
+    local array, count, max_index = true, 0, 0
+    for key in pairs(value) do
+        if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+            array = false
+            break
+        end
+        count = count + 1
+        if key > max_index then max_index = key end
+    end
+
+    local parts = {}
+    if array and count > 0 and count == max_index then
+        for index = 1, max_index do
+            parts[index] = shot_diag_encode(value[index], stack) or "null"
+        end
+        stack[value] = nil
+        return "[" .. table.concat(parts, ",") .. "]"
+    end
+
+    for key, item in pairs(value) do
+        if type(key) == "string" then
+            local encoded = shot_diag_encode(item, stack)
+            if encoded ~= nil then
+                parts[#parts + 1] = shot_diag_escape(key) .. ":" .. encoded
+            end
+        end
+    end
+    stack[value] = nil
+    return "{" .. table.concat(parts, ",") .. "}"
+end
 local function shot_diag_json(value)
-    local ok, encoded = pcall(json.stringify, value)
+    local ok, encoded = pcall(shot_diag_encode, value, {})
     if not ok or type(encoded) ~= "string" then return nil, "JSON serialization failed" end
     return encoded
 end
@@ -1343,7 +1433,7 @@ do
     end
     source_controls.extrap=preset_manager.push("Miscellaneous","source.extrapolation",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("arrows-left-right"),pad_spaces(7),"Extrapolation"),false))
 
-    source_controls.resolver_assist=preset_manager.push("Miscellaneous","source.resolver_assist",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("crosshairs"),pad_spaces(7),"Correction"),false))
+    source_controls.resolver_assist=preset_manager.push("Miscellaneous","source.resolver_assist",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("crosshairs"),pad_spaces(7),"Correction"),true))
     source_controls.force=preset_manager.push("Miscellaneous","source.force_interpolation",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("arrows-rotate"),pad_spaces(7),"Interpolation"),false))
     source_controls.force_shot=preset_manager.push("Miscellaneous","source.force_shot",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("crosshairs"),pad_spaces(7),"Force Shot"),false))
 
@@ -3774,6 +3864,15 @@ do
         set_override(notification_accent(), message, label)
     end
 
+    local function notification_measure(font, text)
+        text = tostring(text or "")
+        local ok, measured = pcall(render.measure_text, font, nil, text)
+        local width = ok and measured and tonumber(measured.x) or nil
+        if finite_number(width) and (width > 0 or text == "") then return width end
+        if text == "" then return 0 end
+        return math.max(1, #text) * 7
+    end
+
     local function notification_wrap(segments, font, max_width)
         local lines, current, current_plain = {}, {}, ""
         local function push_line()
@@ -3785,10 +3884,10 @@ do
         local function add_piece(piece, accent)
             if piece == "" then return end
             local candidate = current_plain .. piece
-            if current_plain ~= "" and render.measure_text(font, nil, candidate).x > max_width then
+            if current_plain ~= "" and notification_measure(font, candidate) > max_width then
                 push_line()
             end
-            if render.measure_text(font, nil, piece).x <= max_width then
+            if notification_measure(font, piece) <= max_width then
                 current[#current + 1] = {text = piece, accent = accent}
                 current_plain = current_plain .. piece
                 return
@@ -3796,7 +3895,7 @@ do
 
             local chunk = ""
             for char in piece:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-                if chunk ~= "" and render.measure_text(font, nil, chunk .. char).x > max_width then
+                if chunk ~= "" and notification_measure(font, chunk .. char) > max_width then
                     current[#current + 1] = {text = chunk, accent = accent}
                     push_line()
                     chunk = char
@@ -3830,19 +3929,19 @@ do
     local function notification_text_size(font)
         local ok, measured = pcall(render.measure_text, font, nil, "Ag")
         if ok and measured and measured.y and measured.y > 0 then return measured.y end
-        return 13
+        return 15
     end
 
     local function build_notification_layout(item, font_body, max_card_width)
         local message = item.segments or {{text = string.lower(strip_markup(item.text or "")), accent = false}}
-        local lines = notification_wrap(message, font_body, math.max(80, max_card_width - 36))
+        local lines = notification_wrap(message, font_body, math.max(80, max_card_width - 40))
         local max_line_width = 0
         for _, line in ipairs(lines) do
-            max_line_width = math.max(max_line_width, render.measure_text(font_body, nil, line_plain(line)).x)
+            max_line_width = math.max(max_line_width, notification_measure(font_body, line_plain(line)))
         end
-        local width = math.min(max_card_width, math.max(122, max_line_width + 36))
-        local line_height = notification_text_size(font_body)
-        local height = math.max(30, #lines * line_height + 14)
+        local width = math.min(max_card_width, math.max(132, max_line_width + 40))
+        local line_height = math.max(15, notification_text_size(font_body))
+        local height = math.max(34, #lines * line_height + 18)
         return {item = item, width = width, height = height, lines = lines, line_height = line_height}
     end
 
@@ -3985,7 +4084,7 @@ do
                 for _, segment in ipairs(line) do
                     local c = segment.accent and accent or color(226, 230, 238, 255)
                     render.text(font_body, vector(cursor_x, baseline), color(c.r, c.g, c.b, math.floor(255 * alpha)), nil, segment.text)
-                    cursor_x = cursor_x + render.measure_text(font_body, nil, segment.text).x
+                    cursor_x = cursor_x + notification_measure(font_body, segment.text)
                 end
             end
             current_top = current_top + height + gap
@@ -5059,17 +5158,186 @@ do
             if not vec_ok(origin) or not vec_ok(velocity) or not finite(flags) then return nil end
             if not finite(sim) then sim = tonumber(globals.curtime) end
             if not finite(sim) then return nil end
-            local speed = math.sqrt(velocity.x*velocity.x+velocity.y*velocity.y+velocity.z*velocity.z)
-            if not finite(speed) then return nil end
             local sample_time = tonumber(globals.realtime)
             if not finite(sample_time) then return nil end
+            local speed = math.sqrt(velocity.x*velocity.x+velocity.y*velocity.y+velocity.z*velocity.z)
+            local planar = math.sqrt(velocity.x*velocity.x+velocity.y*velocity.y)
+            if not finite(speed) or not finite(planar) then return nil end
             return {
                 origin=vec_copy(origin), velocity=vec_copy(velocity), sim=sim,
-                flags=flags, time=sample_time, speed=speed
+                flags=flags, time=sample_time, speed=speed, planar=planar
             }
         end)
         if not ok then return nil end
         return d
+    end
+
+    local function gear_value(key, default)
+        return correction_value(key, default)
+    end
+    local function adaptive_option(name)
+        return correction_adaptive(name)
+    end
+    local function cvar_value(name, fallback)
+        local ok, value = pcall(function()
+            local ref = cvar[name]
+            if not ref then return nil end
+            if type(ref.float) == "function" then return ref:float() end
+            if type(ref.get_float) == "function" then return ref:get_float() end
+            return nil
+        end)
+        if ok and finite(value) then return value end
+        return fallback
+    end
+    local function read_incoming_latency()
+        local incoming
+        local channel_ok, channel = pcall(utils.net_channel)
+        if channel_ok and channel then
+            local function read_lane(source, index)
+                local ok, value = pcall(function() return tonumber(source[index]) end)
+                if ok and finite(value) and value > 0 and value < 10 then return value end
+            end
+            if channel.avg_latency then
+                incoming = read_lane(channel.avg_latency, 1) or read_lane(channel.avg_latency, 0)
+            end
+            if incoming == nil and channel.latency then
+                incoming = read_lane(channel.latency, 1) or read_lane(channel.latency, 0)
+            end
+            local loopback = false
+            pcall(function() loopback = channel.is_loopback == true end)
+            if incoming ~= nil and incoming <= 0.0001 and not loopback then incoming = nil end
+        end
+        if incoming == nil then
+            local ping_ok, ping = pcall(function()
+                local me = entity.get_local_player()
+                local resource = entity.get_player_resource()
+                if not me or not resource then return nil end
+                return tonumber(resource.m_iPing[me:get_index()])
+            end)
+            if ping_ok and finite(ping) and ping >= 1 and ping < 5000 then
+                incoming = ping / 2000
+            end
+        end
+        if not finite(incoming) or incoming < 0 then incoming = 0 end
+        return math.clamp(incoming, 0, 0.5)
+    end
+    local function interp_seconds()
+        local interp = math.max(0, cvar_value("cl_interp", 0))
+        local ratio = math.max(0, cvar_value("cl_interp_ratio", 1))
+        local rate = math.max(1, cvar_value("cl_updaterate", 64))
+        local interval = tonumber(globals.tickinterval)
+        if not finite(interval) or interval <= 0 then interval = 1/64 end
+        interp = math.max(interp, ratio / rate)
+        return math.clamp(interp, 0, interval * 6)
+    end
+    local function weapon_predict_scale()
+        local ok, scale = pcall(function()
+            local me = entity.get_local_player()
+            if not me or not me:is_alive() then return 1 end
+            local weapon = me:get_player_weapon()
+            local info = weapon and weapon:get_weapon_info()
+            if not info then return 1 end
+            local kind = tonumber(info.weapon_type)
+            local index = tonumber(weapon:get_weapon_index())
+            if kind == 5 then
+                if index == 9 or index == 40 then return 1.10 end
+                return 1.06
+            elseif kind == 3 then
+                return 1.00
+            elseif kind == 2 then
+                return 0.97
+            elseif kind == 1 then
+                return 0.93
+            end
+            return 1
+        end)
+        if ok and finite(scale) then return math.clamp(scale, 0.85, 1.15) end
+        return 1
+    end
+    local function velocity_estimate(entry, live)
+        local samples = entry.samples or {}
+        local count = #samples
+        if count < 2 then
+            return live.velocity, 0, 0, 0
+        end
+        local newest = samples[count]
+        local oldest = samples[math.max(1, count - 2)]
+        local dt = newest.sim - oldest.sim
+        if not finite(dt) or dt <= 0.001 or dt > 0.40 then
+            return live.velocity, 0, 0, 0
+        end
+        local vx = (newest.origin.x - oldest.origin.x) / dt
+        local vy = (newest.origin.y - oldest.origin.y) / dt
+        local vz = (newest.origin.z - oldest.origin.z) / dt
+        if not finite(vx) or not finite(vy) or not finite(vz) then
+            return live.velocity, 0, 0, 0
+        end
+        local blend = math.clamp(0.35 + (count - 2) * 0.09, 0.35, 0.78)
+        vx = live.velocity.x * (1 - blend) + vx * blend
+        vy = live.velocity.y * (1 - blend) + vy * blend
+        vz = live.velocity.z * (1 - blend) + vz * blend
+        local ax, ay, az = 0, 0, 0
+        if count >= 3 then
+            local middle = samples[count-1]
+            local previous = samples[count-2]
+            local dt2 = newest.sim - middle.sim
+            local dt1 = middle.sim - previous.sim
+            if dt2 > 0.001 and dt1 > 0.001 and dt2 < 0.25 and dt1 < 0.25 then
+                ax = (newest.velocity.x - middle.velocity.x) / dt2
+                ay = (newest.velocity.y - middle.velocity.y) / dt2
+                az = (newest.velocity.z - middle.velocity.z) / dt2
+                local bx = (middle.velocity.x - previous.velocity.x) / dt1
+                local by = (middle.velocity.y - previous.velocity.y) / dt1
+                local bz = (middle.velocity.z - previous.velocity.z) / dt1
+                ax = ax * 0.62 + bx * 0.38
+                ay = ay * 0.62 + by * 0.38
+                az = az * 0.62 + bz * 0.38
+            end
+        end
+        ax = math.clamp(ax, -1400, 1400)
+        ay = math.clamp(ay, -1400, 1400)
+        az = math.clamp(az, -1800, 1200)
+        return vector(vx, vy, vz), ax, ay, az
+    end
+    local function push_sample(entry, sample)
+        entry.samples = entry.samples or {}
+        local samples = entry.samples
+        local last = samples[#samples]
+        local changed = false
+        if last then
+            if sample.sim < last.sim - 0.0005 then
+                entry.samples = { sample }
+                entry.good = 1
+                return true
+            elseif math.abs(sample.sim - last.sim) <= 0.0005 then
+                local moved = vec_dist(sample.origin, last.origin)
+                local velocity_delta = vec_dist(sample.velocity, last.velocity)
+                if moved <= 1.5 and velocity_delta <= 12 then
+                    samples[#samples] = sample
+                    return false
+                end
+                samples[#samples] = sample
+                return true
+            else
+                local dt = sample.sim - last.sim
+                local distance = vec_dist(sample.origin, last.origin)
+                local velocity_delta = vec_dist(sample.velocity, last.velocity)
+                local plausible = dt <= 0.40
+                    and distance <= math.max(48, math.min(120, last.speed * dt + 40))
+                    and velocity_delta <= math.max(220, 1500 * dt)
+                changed = plausible
+            end
+        else
+            changed = true
+        end
+        samples[#samples + 1] = sample
+        while #samples > 12 do table.remove(samples, 1) end
+        if changed then
+            entry.good = math.min(16, (entry.good or 0) + 1)
+        else
+            entry.good = math.max(0, (entry.good or 0) - 1)
+        end
+        return changed
     end
     local function observe_enemies()
         local observe_time = tonumber(globals.realtime)
@@ -5090,62 +5358,36 @@ do
             return
         end
         if not globals.is_connected or not globals.is_in_game then
-            predictions={}
+            predictions = {}
             status = "waiting for game"
             return
         end
-        local seen={}
-        local ok=pcall(function()
-            entity.get_players(true,false,function(ent)
+        local seen = {}
+        local ok = pcall(function()
+            entity.get_players(true, false, function(ent)
                 if not valid_enemy(ent) then return end
-                local key=snapshot(ent)
-                local id=identity(ent)
-                if not key or not id then return end
-                local old=predictions[id]
-                local good=0
-                local previous,older=nil,nil
-                local current=key
-                if old and old.uid==id and old.current then
-                    local prior=old.current
-                    local dt=key.sim-prior.sim
-                    local distance=vec_dist(key.origin,prior.origin)
-                    local dvx=key.velocity.x-prior.velocity.x
-                    local dvy=key.velocity.y-prior.velocity.y
-                    local dvz=key.velocity.z-prior.velocity.z
-                    local velocity_delta=math.sqrt(dvx*dvx+dvy*dvy+dvz*dvz)
-                    if dt>0.001 and dt<=0.20 then
-                        local plausible = distance <= math.max(36, math.min(80, prior.speed*dt+32))
-                            and velocity_delta <= math.max(180, 1100*dt)
-                        if plausible then
-                            previous=prior
-                            older=old.previous
-                            good=math.min(10,(old.good or 0)+1)
-                        else
-
-                            good=0
-                        end
-                    elseif math.abs(dt)<=0.001 and distance<=2.0 and velocity_delta<=80 then
-
-                        current=prior
-                        previous=old.previous
-                        older=old.older
-                        good=old.good or 0
-                    else
-                        good=0
-                    end
+                local sample = snapshot(ent)
+                local id = identity(ent)
+                if not sample or not id then return end
+                local entry = predictions[id]
+                if not entry then
+                    entry = { uid = id, samples = {}, good = 0, created = observe_time }
+                    predictions[id] = entry
                 end
-                predictions[id]={uid=id,current=current,previous=previous,older=older,good=good,seen=key.time}
-                seen[id]=true
+                push_sample(entry, sample)
+                entry.current = sample
+                entry.seen = sample.time
+                seen[id] = true
             end)
         end)
         if not ok then
             predictions = {}
-            status="enemy enumeration unavailable; resampling"
+            status = "enemy enumeration unavailable; resampling"
             return
         end
-        local now=tonumber(globals.realtime) or 0
-        for id,entry in pairs(predictions) do
-            if not seen[id] and now-(entry.seen or 0)>0.35 then predictions[id]=nil end
+        local now = tonumber(globals.realtime) or 0
+        for id, entry in pairs(predictions) do
+            if not seen[id] and now - (entry.seen or 0) > 0.4 then predictions[id] = nil end
         end
     end
     prediction_enabled = function()
@@ -5153,211 +5395,213 @@ do
     end
     local function predict(ent)
         if not prediction_enabled() or not valid_enemy(ent) then return nil end
-        local id=identity(ent)
-        local entry=id and predictions[id]
-        if not entry or not entry.current or entry.good<1 or not entry.previous then
-            status="collecting stable enemy samples"
+        local id = identity(ent)
+        local entry = id and predictions[id]
+        if not entry or not entry.current then
+            status = "collecting stable enemy samples"
             return nil
         end
-        entry.prediction=nil
-        local live=snapshot(ent)
-        if not live or identity(ent) ~= id then status="invalid or changed enemy snapshot";return nil end
-        local sample_age=(tonumber(globals.realtime) or 0)-(entry.seen or 0)
-        if sample_age>0.12 or sample_age<0 then status="stale enemy snapshot";return nil end
-        local curtime=tonumber(globals.curtime)
-        local simulation_age=0
+        local live = snapshot(ent)
+        if not live or identity(ent) ~= id then status = "invalid or changed enemy snapshot"; return nil end
+        local sample_age = (tonumber(globals.realtime) or 0) - (entry.seen or 0)
+        if sample_age > 0.20 or sample_age < 0 then status = "stale enemy snapshot"; return nil end
+        local curtime = tonumber(globals.curtime)
+        local simulation_age = 0
         if finite(curtime) and finite(live.sim) then
-            simulation_age=curtime-live.sim
-            if simulation_age < -0.10 or simulation_age > 0.28 then
-                status="stale simulation-time sample"
+            simulation_age = curtime - live.sim
+            if simulation_age < -0.12 or simulation_age > 0.40 then
+                status = "stale simulation-time sample"
                 return nil
             end
-            simulation_age=math.max(0,simulation_age)
+            simulation_age = math.max(0, simulation_age)
         end
-        local interval=tonumber(globals.tickinterval)
-        if not finite(interval) or interval<1/256 or interval>1/16 then status="invalid tick interval";return nil end
-
-        local incoming_latency
-        local channel_ok, channel = pcall(utils.net_channel)
-        if channel_ok and channel then
-            local function read_lane(source, index)
-                local ok, value = pcall(function() return tonumber(source[index]) end)
-                if ok and finite(value) and value >= 0 and value < 10 then return value end
-            end
-            if channel.avg_latency then incoming_latency = read_lane(channel.avg_latency, 1) end
-            if incoming_latency == nil and channel.latency then
-                incoming_latency = read_lane(channel.latency, 1)
-            end
-            local loopback = false
-            pcall(function() loopback = channel.is_loopback == true end)
-            if incoming_latency == 0 and not loopback then incoming_latency = nil end
-        end
-        if incoming_latency == nil then
-            local ping_ok, ping = pcall(function()
-                local me = entity.get_local_player()
-                local resource = entity.get_player_resource()
-                if not me or not resource then return nil end
-                return tonumber(resource.m_iPing[me:get_index()])
-            end)
-            if ping_ok and finite(ping) and ping >= 0 and ping < 5000 then
-                incoming_latency = ping / 2000
-            end
-        end
-        local interpolation_delay = 0
-        local interp_ok, interp_value = pcall(function()
-            local ref = cvar.cl_interp
-            if not ref then return nil end
-            return tonumber(ref:float())
-        end)
-        if interp_ok and finite(interp_value) then
-            interpolation_delay = math.max(0, interp_value)
-        end
-        -- Source interpolation is the greater of cl_interp and
-        -- cl_interp_ratio / cl_updaterate when both controls are available.
-        local ratio_ok, interp_ratio = pcall(function()
-            local ref = cvar.cl_interp_ratio
-            return ref and tonumber(ref:float()) or nil
-        end)
-        local rate_ok, update_rate = pcall(function()
-            local ref = cvar.cl_updaterate
-            return ref and tonumber(ref:float()) or nil
-        end)
-        if ratio_ok and rate_ok and finite(interp_ratio) and finite(update_rate)
-            and interp_ratio >= 0 and update_rate > 0 then
-            interpolation_delay = math.max(interpolation_delay, interp_ratio / update_rate)
-        end
-        interpolation_delay = math.clamp(interpolation_delay, 0, interval * 4)
-        local latency_seconds = math.max(incoming_latency or 0, simulation_age, interval)
-            + interpolation_delay
-        local tick_count=math.clamp(math.ceil(latency_seconds/interval),1,8)
-        local planar_speed=math.sqrt(live.velocity.x*live.velocity.x+live.velocity.y*live.velocity.y)
-        if planar_speed>260 then
-            tick_count=math.min(tick_count,2)
-        elseif planar_speed>190 then
-            tick_count=math.min(tick_count,3)
-        elseif planar_speed>130 then
-            tick_count=math.min(tick_count,4)
-        end
-        local confidence = entry.good or 0
-
-        local confidence_cap = confidence >= 8 and 7 or (confidence >= 5 and 5 or 3)
-        if sample_age>0.06 then confidence_cap=math.min(confidence_cap,3) end
-        if sample_age>0.09 then confidence_cap=math.min(confidence_cap,2) end
-        tick_count=math.min(tick_count,confidence_cap)
-        local previous = entry.previous
-        local measured_acceleration = 0
-        local measured_sample_dt = 0
-        if previous and live.sim > previous.sim then
-            local sample_dt = live.sim - previous.sim
-            if sample_dt > 0.001 and sample_dt < 0.20 then
-                measured_sample_dt = sample_dt
-                local dvx = live.velocity.x - previous.velocity.x
-                local dvy = live.velocity.y - previous.velocity.y
-                local dvz = live.velocity.z - previous.velocity.z
-                local acceleration = math.sqrt(dvx*dvx + dvy*dvy + dvz*dvz) / sample_dt
-                measured_acceleration = finite(acceleration) and acceleration or math.huge
-
-                local old_speed=math.sqrt(previous.velocity.x^2+previous.velocity.y^2)
-                local new_speed=math.sqrt(live.velocity.x^2+live.velocity.y^2)
-                if old_speed>35 and new_speed>35 then
-                    local dot=(previous.velocity.x*live.velocity.x+previous.velocity.y*live.velocity.y)/(old_speed*new_speed)
-                    if dot < -0.15 then tick_count=math.min(tick_count,1)
-                    elseif dot < 0.55 then tick_count=math.min(tick_count,2) end
-                end
-                if acceleration > 950 then tick_count = math.min(tick_count, 2)
-                elseif acceleration > 600 then tick_count = math.min(tick_count, 3) end
-            end
-        end
-        local ok,sim=pcall(function()
-            local movement=ent:simulate_movement(live.origin,live.velocity,live.flags)
-            if not movement then error("movement simulation unavailable") end
-            movement:think(tick_count)
-            return {origin=movement.origin,velocity=movement.velocity,collision=movement.did_hit_collision}
-        end)
-        if not ok or not sim or not vec_ok(sim.origin) or not vec_ok(sim.velocity) or type(sim.collision)~="boolean" then
-            status="movement simulation failed";return nil
-        end
-        local after=snapshot(ent)
-        if not after or math.abs(after.sim-live.sim)>0.0001 or vec_dist(after.origin,live.origin)>0.05 then
-            status="enemy record changed during simulation";return nil
-        end
-        local predicted=vec_copy(sim.origin)
-        local dt=interval*tick_count
-        local speed=math.sqrt(live.velocity.x^2+live.velocity.y^2+live.velocity.z^2)
-        if vec_dist(predicted,live.origin)>speed*dt+40 then status="unbounded prediction rejected";return nil end
-        local prev=entry.previous
-        local divergence=0
-        local velocity_change=0
-        if prev and live.sim>prev.sim then
-            local sample_dt=live.sim-prev.sim
-            if sample_dt>0.001 and sample_dt<0.25 then
-                local ax=math.clamp((live.velocity.x-prev.velocity.x)/sample_dt,-1000,1000)
-                local ay=math.clamp((live.velocity.y-prev.velocity.y)/sample_dt,-1000,1000)
-                local az=math.clamp((live.velocity.z-prev.velocity.z)/sample_dt,-1500,1500)
-                local older=entry.older
-                if older and prev.sim>older.sim then
-                    local older_dt=prev.sim-older.sim
-                    if older_dt>0.001 and older_dt<0.20 then
-                        local ox=(prev.velocity.x-older.velocity.x)/older_dt
-                        local oy=(prev.velocity.y-older.velocity.y)/older_dt
-                        local oz=(prev.velocity.z-older.velocity.z)/older_dt
-
-                        ax=ax*0.65+math.clamp(ox,-1000,1000)*0.35
-                        ay=ay*0.65+math.clamp(oy,-1000,1000)*0.35
-                        az=az*0.65+math.clamp(oz,-1500,1500)*0.35
-                    end
-                end
-                local accel_scale=confidence>=6 and 0.85 or 0.55
-                ax,ay,az=ax*accel_scale,ay*accel_scale,az*accel_scale
-                local ex=live.origin.x+live.velocity.x*dt+0.5*ax*dt*dt
-                local ey=live.origin.y+live.velocity.y*dt+0.5*ay*dt*dt
-                local ez=live.origin.z+live.velocity.z*dt+0.5*az*dt*dt
-                divergence=math.sqrt((predicted.x-ex)^2+(predicted.y-ey)^2+(predicted.z-ez)^2)
-                velocity_change=math.sqrt((live.velocity.x-prev.velocity.x)^2+(live.velocity.y-prev.velocity.y)^2+(live.velocity.z-prev.velocity.z)^2)
-
-                if not sim.collision and divergence <= 7 + tick_count * 1.25 then
-                    local blend = math.clamp(0.06 + (confidence / 10) * 0.12, 0.06, 0.18)
-                    predicted.x = predicted.x * (1-blend) + ex * blend
-                    predicted.y = predicted.y * (1-blend) + ey * blend
-                    predicted.z = predicted.z * (1-blend) + ez * blend
-                end
-            end
-        end
-        if sim.collision and live.speed>35 then status="prediction rejected: collision";return nil end
-        if planar_speed>300 and tick_count>2 then status="prediction rejected: horizon too long for speed";return nil end
-        if divergence>10+tick_count or measured_acceleration>1800 then
-            status = measured_acceleration > 1800
-                and "prediction rejected: acceleration spike"
-                or "prediction rejected: high divergence"
+        local interval = tonumber(globals.tickinterval)
+        if not finite(interval) or interval < 1/256 or interval > 1/16 then
+            status = "invalid tick interval"
             return nil
         end
-        local result={origin=predicted,live_origin=live.origin,velocity=vec_copy(sim.velocity),
-            collision=sim.collision,divergence=divergence,velocity_change=velocity_change,
-            acceleration=measured_acceleration,sample_dt=measured_sample_dt,
-            samples=entry.good or 0,ticks=tick_count,time=tonumber(globals.realtime) or 0,id=id}
-        entry.prediction=result
-        status=string.format("enemy prediction %dt / div %.1f",tick_count,divergence)
+
+        local latency = read_incoming_latency()
+        local interp = interp_seconds()
+        local lead = math.max(simulation_age, interval * 0.5)
+        if adaptive_option("Ping Compensation") then
+            lead = math.max(lead, latency)
+        end
+        if adaptive_option("Smart Interp") then
+            lead = lead + interp * 0.90
+        else
+            lead = lead + interp * 0.35
+        end
+        lead = math.clamp(lead, 0, 0.20)
+
+        local smoothed, ax, ay, az = velocity_estimate(entry, live)
+        if not vec_ok(smoothed) then smoothed = vec_copy(live.velocity) end
+        local planar_speed = math.sqrt(smoothed.x * smoothed.x + smoothed.y * smoothed.y)
+        local speed = math.sqrt(smoothed.x * smoothed.x + smoothed.y * smoothed.y + smoothed.z * smoothed.z)
+        local max_ticks = math.clamp(math.floor(gear_value("max_ticks", 8)), 1, 14)
+        local speed_scale = 1
+        if adaptive_option("Auto Speed Adjust") then
+            if planar_speed > 250 then speed_scale = 1.25
+            elseif planar_speed > 180 then speed_scale = 1.15
+            elseif planar_speed > 110 then speed_scale = 1.06
+            elseif planar_speed < 25 then speed_scale = 0.85 end
+        end
+        local duck = 0
+        pcall(function() duck = math.clamp(tonumber(ent.m_flDuckAmount) or 0, 0, 1) end)
+        if adaptive_option("Crouch Predict") and duck > 0.5 and planar_speed < 120 then
+            speed_scale = speed_scale * 0.92
+        end
+        local weapon_scale = weapon_predict_scale()
+        local ticks_float = math.clamp((lead / interval) * speed_scale * weapon_scale, 0.6, max_ticks)
+        if simulation_age > 0.16 then
+            ticks_float = math.min(ticks_float, 3)
+        end
+        local tick_count = math.max(1, math.ceil(ticks_float))
+        local dt = ticks_float * interval
+        local defensive = simulation_age > interval * 2.5
+            or (planar_speed < 1 and sample_age > interval * 2)
+        if defensive then
+            ticks_float = math.min(ticks_float, 2)
+            tick_count = math.max(1, math.ceil(ticks_float))
+            dt = ticks_float * interval
+        end
+
+        local analytic = nil
+        local ground = bit.band(live.flags, 1) ~= 0
+        local gravity = ground and 0 or -800
+        local use_accel = adaptive_option("Advanced Calculation")
+        local accel_scale = use_accel and 0.55 or 0.25
+        local ex = live.origin.x + smoothed.x * dt + 0.5 * ax * accel_scale * dt * dt
+        local ey = live.origin.y + smoothed.y * dt + 0.5 * ay * accel_scale * dt * dt
+        local ez = live.origin.z + smoothed.z * dt + 0.5 * (az * accel_scale + gravity) * dt * dt
+        if finite(ex) and finite(ey) and finite(ez) then
+            analytic = vector(ex, ey, ez)
+        end
+
+        local sim = nil
+        if adaptive_option("Movement Predict") ~= false then
+            local sim_ok, sim_result = pcall(function()
+                local movement = ent:simulate_movement(live.origin, smoothed, live.flags)
+                if not movement then error("movement simulation unavailable") end
+                movement:think(tick_count)
+                return {origin = movement.origin, velocity = movement.velocity,
+                    collision = movement.did_hit_collision}
+            end)
+            if sim_ok and sim_result and vec_ok(sim_result.origin)
+                and vec_ok(sim_result.velocity) and type(sim_result.collision) == "boolean" then
+                sim = sim_result
+            end
+        end
+
+        local after = snapshot(ent)
+        if after and (math.abs(after.sim - live.sim) > 0.0005 or vec_dist(after.origin, live.origin) > 0.5) then
+            status = "enemy record changed during simulation"
+            return nil
+        end
+
+        local predicted = analytic and vec_copy(analytic) or vec_copy(live.origin)
+        local source = "analytic"
+        local collision = false
+        local divergence = 0
+        if sim then
+            local sim_origin = vec_copy(sim.origin)
+            collision = sim.collision == true
+            if analytic then
+                divergence = vec_dist(sim_origin, analytic)
+                local analytic_weight = 0.30
+                if use_accel then analytic_weight = 0.48 end
+                if collision then analytic_weight = 0.15 end
+                predicted = vector(
+                    sim_origin.x * (1 - analytic_weight) + analytic.x * analytic_weight,
+                    sim_origin.y * (1 - analytic_weight) + analytic.y * analytic_weight,
+                    sim_origin.z * (1 - analytic_weight) + analytic.z * analytic_weight)
+                source = "blend"
+            else
+                predicted = sim_origin
+                source = "simulation"
+            end
+        elseif not analytic then
+            status = "movement simulation failed"
+            return nil
+        end
+
+        local max_reach = speed * dt + 48
+        if not vec_ok(predicted) or vec_dist(predicted, live.origin) > max_reach then
+            if analytic and vec_dist(analytic, live.origin) <= max_reach then
+                predicted = analytic
+                source = "analytic-clamped"
+            else
+                status = "unbounded prediction rejected"
+                return nil
+            end
+        end
+
+        local last_sample = entry.samples and entry.samples[#entry.samples] or nil
+        local prior_sample = entry.samples and entry.samples[#entry.samples - 1] or nil
+        local sample_dt = 0
+        local velocity_change = 0
+        if last_sample and prior_sample then
+            sample_dt = last_sample.sim - prior_sample.sim
+            velocity_change = vec_dist(last_sample.velocity, prior_sample.velocity)
+        end
+
+        local confidence = 0.25
+        confidence = confidence + math.clamp((entry.good or 0) / 10, 0, 0.35)
+        confidence = confidence + math.clamp((#(entry.samples or {}) - 1) / 10, 0, 0.20)
+        confidence = confidence - math.clamp(divergence / 40, 0, 0.25)
+        confidence = confidence - math.clamp(velocity_change / 1600, 0, 0.12)
+        confidence = confidence - math.clamp((math.sqrt(ax*ax+ay*ay+az*az) - 500) / 2600, 0, 0.20)
+        confidence = confidence - math.clamp(sample_age / 0.30, 0, 0.20)
+        confidence = confidence - (simulation_age > 0.12 and 0.10 or 0)
+        if collision then confidence = confidence - 0.20 end
+        if defensive then confidence = confidence - 0.08 end
+        confidence = math.clamp(confidence, 0.05, 0.98)
+
+        local result = {
+            origin = predicted,
+            live_origin = live.origin,
+            velocity = vec_copy(smoothed),
+            collision = collision,
+            divergence = divergence,
+            velocity_change = velocity_change,
+            acceleration = math.sqrt(ax*ax + ay*ay + az*az),
+            sample_dt = sample_dt,
+            samples = entry.good or 0,
+            history_samples = #(entry.samples or {}),
+            ticks = tick_count,
+            tick_fraction = ticks_float,
+            lead_seconds = lead,
+            confidence = confidence,
+            defensive = defensive,
+            weapon_scale = weapon_scale,
+            source = source,
+            speed = speed,
+            planar_speed = planar_speed,
+            time = tonumber(globals.realtime) or 0,
+            id = id
+        }
+        entry.prediction = result
+        status = string.format("enemy prediction %.1ft / conf %.2f / div %.1f", ticks_float, confidence, divergence)
         return result
     end
     local function get_prediction_for_threat(threat)
         if not prediction_enabled() or not valid_enemy(threat) then return nil end
-        local id=identity(threat)
-        local entry=id and predictions[id]
+        local id = identity(threat)
+        local entry = id and predictions[id]
         if not entry or not entry.prediction then return nil end
-        local p=entry.prediction
-        local age=(tonumber(globals.realtime) or 0)-(tonumber(p.time) or -math.huge)
-        if p.id~=id or age<0 or age>0.11 or p.collision
-            or not vec_ok(p.origin) or not vec_ok(p.live_origin) or not vec_ok(p.velocity)
+        local p = entry.prediction
+        local age = (tonumber(globals.realtime) or 0) - (tonumber(p.time) or -math.huge)
+        if p.id ~= id or age < 0 or age > 0.16 or not vec_ok(p.origin)
+            or not vec_ok(p.live_origin) or not vec_ok(p.velocity)
             or not finite(tonumber(p.divergence)) or not finite(tonumber(p.velocity_change))
-            or not finite(tonumber(p.acceleration))
-            or p.divergence>18 or p.acceleration>1800 or (p.samples or 0)<1 then return nil end
+            or not finite(tonumber(p.acceleration)) then return nil end
         return p
     end
     events.net_update_end(observe_enemies)
     events.createmove(function()
-        if not globals.is_connected or not globals.is_in_game then status="waiting for game";return end
-        local threat=entity.get_threat()
-        if not valid_enemy(threat) then status="waiting for threat";return end
+        if not globals.is_connected or not globals.is_in_game then status = "waiting for game"; return end
+        local threat = entity.get_threat()
+        if not valid_enemy(threat) then status = "waiting for threat"; return end
         predict(threat)
     end)
     events.level_init(function()
@@ -5370,7 +5614,7 @@ do
         last_observe_time = nil
         status = "stopped"
     end)
-    source_controls.extrap_status=function() return status end
+    source_controls.extrap_status = function() return status end
 
     social_enemy_prediction = get_prediction_for_threat
 end
@@ -5380,6 +5624,7 @@ do
     local memory = {}
     local active_key = nil
     local max_targets = 64
+    local write_score_min = 0.48
 
     local animlayer_type = ffi.typeof("struct { bool client_blend; float blend_in; void *studio_hdr; int dispatch_sequence; int second_dispatch_sequence; unsigned int order; unsigned int sequence; float prev_cycle; float weight; float weight_delta_rate; float playback_rate; float cycle; void *entity; char pad_0x0038[0x4]; } **")
 
@@ -6574,10 +6819,7 @@ do
                 local decay = 0.5 ^ (age / 128)
                 exact_hits = (tonumber(candidate_stat.hits) or 0) * decay
                 exact_misses = (tonumber(candidate_stat.misses) or 0) * decay
-                -- Streaks must age too; otherwise a stale run of misses keeps
-                -- penalizing a candidate after its actual evidence has decayed.
-                local raw_streak = math.max(0, tonumber(candidate_stat.miss_streak) or 0)
-                exact_streak = age >= 256 and 0 or math.max(0, raw_streak - math.floor(age / 32))
+                exact_streak = tonumber(candidate_stat.miss_streak) or 0
             end
             local bucket_hits, bucket_misses, bucket_streak = 0, 0, 0
             if bucket_stat then
@@ -6585,8 +6827,7 @@ do
                 local decay = 0.5 ^ (age / 128)
                 bucket_hits = (tonumber(bucket_stat.hits) or 0) * decay * 0.30
                 bucket_misses = (tonumber(bucket_stat.misses) or 0) * decay * 0.30
-                local raw_streak = math.max(0, tonumber(bucket_stat.miss_streak) or 0)
-                bucket_streak = age >= 256 and 0 or math.max(0, raw_streak - math.floor(age / 32))
+                bucket_streak = tonumber(bucket_stat.miss_streak) or 0
             end
             local hits = exact_hits + bucket_hits
             local misses = exact_misses + bucket_misses
@@ -6601,17 +6842,9 @@ do
             if streak >= 2 then
                 score = score - math.min(0.16, (streak - 1) * 0.035)
             end
-            if rec.good then
-                local good_age = tick - (tonumber(rec.good.tick) or tick)
-                if good_age >= 0 and good_age <= 128 and finite(rec.good.yaw) then
-                    local distance = math.abs(yaw_delta(c.yaw, rec.good.yaw))
-                    if distance < 42 then
-                        -- A hit is useful evidence, but should not dominate the
-                        -- selector for two seconds at full strength.
-                        local good_decay = 0.5 ^ (good_age / 48)
-                        score = score + (1 - distance / 42) * 0.46 * good_decay
-                    end
-                end
+            if rec.good and tick - rec.good.tick <= 128 then
+                local distance = math.abs(yaw_delta(c.yaw, rec.good.yaw))
+                if distance < 50 then score = score + (1 - distance / 50) * 0.72 end
             end
             for j = #rec.misses, 1, -1 do
                 local miss = rec.misses[j]
@@ -6745,12 +6978,18 @@ do
         if not chosen then return end
         st.last_candidate_yaw = chosen.yaw
         st.last_candidate_label = chosen.label
+        st.last_candidate_score = tonumber(chosen.score)
         st.last_candidate_state = movement
-        if math.abs(yaw_delta(observed, chosen.yaw)) > 0.5 then
-            if set_entity_yaw(threat, chosen.yaw) then
-                st.last_written = chosen.yaw
+        st.last_observed_yaw = observed
+        local confident = finite(st.last_candidate_score) and st.last_candidate_score >= write_score_min
+        if confident then
+            if math.abs(yaw_delta(observed, chosen.yaw)) > 0.5 then
+                if set_entity_yaw(threat, chosen.yaw) then
+                    st.last_written = chosen.yaw
+                end
             end
         else
+            if st.last_written then restore(st) end
             st.last_written = nil
         end
         st.last_mode = chosen.label
@@ -6770,42 +7009,60 @@ do
     end
 
     local pending_shots, pending_sequence = {}, 0
+
+    local function snapshot_resolver(st)
+        local history = {}
+        local samples = st and type(st.history) == "table" and st.history or {}
+        local first_sample = math.max(1, #samples - 7)
+        for i = first_sample, #samples do
+            history[#history + 1] = shot_diag_number(samples[i])
+        end
+        return {
+            enabled = enabled_now(),
+            active = st ~= nil,
+            written = st ~= nil and finite(st.last_written),
+            candidate = st and shot_diag_text(st.last_candidate_label, 48) or nil,
+            candidate_yaw = st and shot_diag_number(st.last_candidate_yaw) or nil,
+            candidate_score = st and shot_diag_number(st.last_candidate_score) or nil,
+            written_yaw = st and shot_diag_number(st.last_written) or nil,
+            base_yaw = st and shot_diag_number(st.base_yaw) or nil,
+            observed_yaw = st and shot_diag_number(st.last_observed_yaw) or nil,
+            last_update = st and shot_diag_number(st.last_update) or nil,
+            fire_tick = shot_diag_number(clock_tick()),
+            write_score_min = shot_diag_number(write_score_min),
+            side = st and shot_diag_number(st.side) or nil,
+            jitter = st and shot_diag_number(st.jitter) or nil,
+            jitter_amplitude = st and shot_diag_number(st.jitter_amplitude) or nil,
+            phase_confidence = st and shot_diag_number(st.phase_conf) or nil,
+            alternating = st and st.alternating == true or false,
+            anemone_alternating = st and st.anemone_alternating == true or false,
+            viera_jitter = st and st.viera_jitter == true or false,
+            history_quality = st and shot_diag_number(st.history_quality) or nil,
+            history = history
+        }
+    end
+
+    social_resolver_snapshot = function(target)
+        local key = target_key(target)
+        return snapshot_resolver(key and memory[key] or nil)
+    end
+
     local function on_fire(event)
         if not event or event.id == nil or not event.target then return end
+        local id = tostring(event.id)
         local key = target_key(event.target)
         local st = key and memory[key] or nil
-        if not st or not finite(st.last_candidate_yaw) then return end
-
         local now = clock_tick()
-        local candidate_tick = tonumber(st.last_update)
-        if not finite(candidate_tick) or candidate_tick > now or now - candidate_tick > 3 then
-            return
-        end
-
-        local id = tostring(event.id)
+        local candidate_tick = st and tonumber(st.last_update) or nil
 
         local diag_fire = shot_diag_pending[id]
         if diag_fire then
-            local history = {}
-            local samples = type(st.history) == "table" and st.history or {}
-            local first_sample = math.max(1, #samples - 7)
-            for i = first_sample, #samples do
-                history[#history + 1] = shot_diag_number(samples[i])
-            end
-            diag_fire.resolver = {
-                candidate = shot_diag_text(st.last_candidate_label, 48),
-                candidate_yaw = shot_diag_number(st.last_candidate_yaw),
-                base_yaw = shot_diag_number(st.base_yaw),
-                side = shot_diag_number(st.side),
-                jitter = shot_diag_number(st.jitter),
-                jitter_amplitude = shot_diag_number(st.jitter_amplitude),
-                phase_confidence = shot_diag_number(st.phase_conf),
-                alternating = st.alternating == true,
-                anemone_alternating = st.anemone_alternating == true,
-                viera_jitter = st.viera_jitter == true,
-                history_quality = shot_diag_number(st.history_quality),
-                history = history
-            }
+            diag_fire.resolver = snapshot_resolver(st)
+        end
+
+        if not st or not finite(st.last_written) or not finite(st.last_candidate_yaw) then return end
+        if not finite(candidate_tick) or candidate_tick > now or now - candidate_tick > 3 then
+            return
         end
 
         if pending_shots[id] then
@@ -6815,7 +7072,7 @@ do
         pending_sequence = pending_sequence + 1
         pending_shots[id] = {
             key = key,
-            yaw = st.last_candidate_yaw,
+            yaw = st.last_written,
             movement = st.last_candidate_state or "stand",
             label = st.last_candidate_label,
             candidate_tick = candidate_tick,
@@ -6876,7 +7133,8 @@ do
 
         -- High-backtrack correction misses are weaker evidence, not zero evidence.
         update_candidate_feedback(rec, shot.label, false, feedback_weight, ack_tick)
-        rec.miss_count = math.min(12, (rec.miss_count or 0) + 1)
+        rec.miss_count = (tonumber(rec.miss_count) or 0) + 1
+        if rec.miss_count > 12 then rec.miss_count = 1 end
         local yaw = shot.yaw
         local merged = false
         for i = #rec.misses, 1, -1 do
@@ -6993,6 +7251,8 @@ do
             if globals.curtime<next_attack or globals.curtime<next_primary then return false end
             local eye=me:get_eye_position()
             if not valid_vec(eye) then return false end
+            local target_health = tonumber(threat.m_iHealth) or 100
+            local minimum_damage = math.min(30, math.max(1, target_health))
             local best_damage=0
             for hitbox_index=0,18 do
                 local hitbox_ok,hitbox=pcall(function() return threat:get_hitbox_position(hitbox_index) end)
@@ -7005,7 +7265,7 @@ do
                     end
                 end
             end
-            return best_damage>0
+            return best_damage>=minimum_damage
         end)
         if not ok or not should_apply then release();return end
         if owned then
