@@ -1,4 +1,5 @@
 local source_controls = {}
+local social_enemy_prediction = nil
 local ffi = require("ffi")
 local color4 = color4 or function(r,g,b,a) if type(r)=="table" then return color(r.r or r[1],r.g or r[2],r.b or r[3],r.a or r[4] or 255) end return color(r,g,b,a) end
 local function import_color(value)
@@ -66,7 +67,6 @@ do
 end;
 
 local notifications = {};
--- Keep the established local call sites valid; notifications is the implementation.
 local notify = notifications
 local success_sound = "ui\\beepclear.wav";
 local error_sound = "resource\\warning.wav";
@@ -91,21 +91,233 @@ local function finite_number(value)
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
 
+local shot_diagnostics = { entries = {}, sequence = 0, max_entries = 256 }
+local shot_diag_pending = {}
+local shot_diag_pending_sequence = 0
+local shot_diag_pending_limit = 256
+local function shot_diag_field(object, key)
+    local ok, value = pcall(function() return object and object[key] end)
+    if ok then return value end
+    return nil
+end
+local function shot_diag_number(value)
+    local ok, number = pcall(tonumber, value)
+    if ok and finite_number(number) then return number end
+    return nil
+end
+local function shot_diag_text(value, limit)
+    if value == nil then return nil end
+    local ok, result = pcall(tostring, value)
+    if not ok then return nil end
+    result = result:gsub("[%c]", " ")
+    limit = limit or 96
+    if #result > limit then result = result:sub(1, limit) end
+    return result
+end
+local function shot_diag_vector(value)
+    if value == nil then return nil end
+    local ok, x, y, z = pcall(function()
+        return tonumber(value.x), tonumber(value.y), tonumber(value.z)
+    end)
+    if not ok or not finite_number(x) or not finite_number(y) or not finite_number(z) then return nil end
+    return { x = x, y = y, z = z }
+end
+local function shot_diag_prediction(target)
+    if target == nil or type(social_enemy_prediction) ~= "function" then return nil end
+    local ok, prediction = pcall(social_enemy_prediction, target)
+    if not ok or type(prediction) ~= "table" then return nil end
+    local predicted_origin = shot_diag_vector(prediction.origin)
+    local live_origin = shot_diag_vector(prediction.live_origin)
+    if not predicted_origin or not live_origin then return nil end
+    return {
+        origin = predicted_origin,
+        live_origin = live_origin,
+        velocity = shot_diag_vector(prediction.velocity),
+        divergence = shot_diag_number(prediction.divergence),
+        velocity_change = shot_diag_number(prediction.velocity_change),
+        acceleration = shot_diag_number(prediction.acceleration),
+        sample_dt = shot_diag_number(prediction.sample_dt),
+        samples = shot_diag_number(prediction.samples),
+        ticks = shot_diag_number(prediction.ticks),
+        collision = prediction.collision == true
+    }
+end
+local function shot_diag_capture_fire(event)
+    if event == nil then return end
+    local id = shot_diag_field(event, "id")
+    if id == nil then return end
+    local id_key = shot_diag_text(id, 48)
+    if id_key == nil then return end
+    local target = shot_diag_field(event, "target")
+    local fire = {
+        id = id_key,
+        tick = shot_diag_number(globals.tickcount),
+        realtime = shot_diag_number(globals.realtime),
+        aim = shot_diag_vector(shot_diag_field(event, "aim")),
+        angle = shot_diag_vector(shot_diag_field(event, "angle")),
+        wanted_damage = shot_diag_number(shot_diag_field(event, "damage")),
+        hitchance = shot_diag_number(shot_diag_field(event, "hitchance")),
+        hitgroup = shot_diag_number(shot_diag_field(event, "hitgroup")),
+        backtrack_ticks = shot_diag_number(shot_diag_field(event, "backtrack")),
+        prediction = shot_diag_prediction(target)
+    }
+    if target ~= nil then
+        local ok, name = pcall(function() return target:get_name() end)
+        if ok then fire.target = shot_diag_text(name, 96) end
+        ok, name = pcall(function() return target:get_index() end)
+        if ok then fire.target_index = shot_diag_number(name) end
+    end
+    local requested_hitgroups = {
+        [0] = "generic", [1] = "head", [2] = "chest", [3] = "stomach",
+        [4] = "left arm", [5] = "right arm", [6] = "left leg",
+        [7] = "right leg", [8] = "neck", [10] = "gear"
+    }
+    if fire.hitgroup ~= nil then
+        fire.requested_hitgroup_id = fire.hitgroup
+        fire.requested_hitgroup = requested_hitgroups[fire.hitgroup] or "unknown"
+    end
+    shot_diag_pending_sequence = shot_diag_pending_sequence + 1
+    fire.pending_sequence = shot_diag_pending_sequence
+    shot_diag_pending[id_key] = fire
+    local cutoff = (tonumber(globals.tickcount) or 0) - 256
+    local pending_count = 0
+    for pending_id, pending in pairs(shot_diag_pending) do
+        if pending and pending.tick and pending.tick < cutoff then
+            shot_diag_pending[pending_id] = nil
+        else
+            pending_count = pending_count + 1
+        end
+    end
+    while pending_count > shot_diag_pending_limit do
+        local oldest_id, oldest_sequence = nil, math.huge
+        for pending_id, pending in pairs(shot_diag_pending) do
+            local sequence = pending and pending.pending_sequence
+            if type(sequence) == "number" and sequence < oldest_sequence then
+                oldest_id, oldest_sequence = pending_id, sequence
+            end
+        end
+        if oldest_id == nil then break end
+        shot_diag_pending[oldest_id] = nil
+        pending_count = pending_count - 1
+    end
+end
+local function shot_diag_record(event)
+    if event == nil then return end
+    local state = shot_diag_field(event, "state")
+    local target = shot_diag_field(event, "target")
+    local id = shot_diag_field(event, "id")
+    local id_key = id ~= nil and shot_diag_text(id, 48) or nil
+    local fire = id_key ~= nil and shot_diag_pending[id_key] or nil
+    if id_key ~= nil then shot_diag_pending[id_key] = nil end
+    local ack_target_index = nil
+    if target ~= nil then
+        local ok, index = pcall(function() return target:get_index() end)
+        if ok then ack_target_index = shot_diag_number(index) end
+    end
+    local fire_target_matches = fire ~= nil and fire.target_index ~= nil
+        and ack_target_index ~= nil and fire.target_index == ack_target_index
+    local record = {
+        schema = 3,
+        result = state == nil and "hit" or "miss",
+        realtime = shot_diag_number(globals.realtime),
+        curtime = shot_diag_number(globals.curtime),
+        tick = shot_diag_number(globals.tickcount),
+        state = shot_diag_text(state, 64),
+        shot_id = shot_diag_text(id, 48)
+    }
+    if fire then
+        record.fire_correlation = fire_target_matches and "matched"
+            or (fire.target_index == nil or ack_target_index == nil) and "id_only_unverified"
+            or "target_index_mismatch"
+        record.aim_fire = fire
+        if fire_target_matches then
+            record.prediction = fire.prediction
+            record.prediction_phase = "aim_fire"
+        else
+            record.prediction = shot_diag_prediction(target)
+            if record.prediction then record.prediction_phase = "aim_ack" end
+        end
+    else
+        record.fire_correlation = "missing_aim_fire"
+        record.prediction = shot_diag_prediction(target)
+        if record.prediction then record.prediction_phase = "aim_ack" end
+    end
+    if target ~= nil then
+        local ok, name = pcall(function() return target:get_name() end)
+        if ok then record.target = shot_diag_text(name, 96) end
+        ok, name = pcall(function() return target:get_index() end)
+        if ok then record.target_index = shot_diag_number(name) end
+    end
+
+    local hitgroups = {
+        [0] = "generic", [1] = "head", [2] = "chest", [3] = "stomach",
+        [4] = "left arm", [5] = "right arm", [6] = "left leg",
+        [7] = "right leg", [8] = "neck", [10] = "gear"
+    }
+    local hitgroup = shot_diag_number(shot_diag_field(event, "hitgroup"))
+    if hitgroup ~= nil then
+        record.hitgroup_id = hitgroup
+        record.hitgroup = hitgroups[hitgroup] or "unknown"
+    end
+
+    local damage = shot_diag_number(shot_diag_field(event, "damage"))
+    local wanted_damage = shot_diag_number(shot_diag_field(event, "wanted_damage"))
+    local backtrack = shot_diag_number(shot_diag_field(event, "backtrack"))
+    if damage ~= nil then record.damage = damage end
+    if wanted_damage ~= nil then record.wanted_damage = wanted_damage end
+    if backtrack ~= nil then record.backtrack_ticks = math.max(0, math.floor(backtrack)) end
+
+    local aim = shot_diag_vector(shot_diag_field(event, "aim"))
+    if aim then record.ack_aim = aim end
+
+    shot_diagnostics.sequence = shot_diagnostics.sequence + 1
+    record.sequence = shot_diagnostics.sequence
+    local entries = shot_diagnostics.entries
+    entries[#entries + 1] = record
+    while #entries > shot_diagnostics.max_entries do table.remove(entries, 1) end
+end
+local function shot_diag_json(value)
+    local ok, encoded = pcall(json.stringify, value)
+    if not ok or type(encoded) ~= "string" then return nil, "JSON serialization failed" end
+    return encoded
+end
+local function shot_diag_export()
+    local payload = {
+        format = "social-shot-diagnostics",
+        version = 2,
+        count = #shot_diagnostics.entries,
+        entries = shot_diagnostics.entries
+    }
+    local encoded, err = shot_diag_json(payload)
+    if not encoded then
+        notifications.error(err)
+        return
+    end
+    local ok, result = pcall(clipboard.set, encoded)
+    if not ok or result == false then
+        notifications.error("Shot log export failed")
+        return
+    end
+    notifications.success(string.format("Exported %d shot records to clipboard", #shot_diagnostics.entries))
+end
 local interpolation = {};
 local function linear_ease(progress, start, change)
     return start + change * progress
 end
 local last_realtime = nil
 local function get_frame_time()
-    local frame_time = tonumber(globals.frametime)
-    if finite_number(frame_time) and frame_time > 0 then
-        return math.min(frame_time, 0.1)
+    local now = tonumber(globals.realtime)
+    local realtime_delta = 0
+    if finite_number(now) then
+        if finite_number(last_realtime) then
+            realtime_delta = now - last_realtime
+        end
+        last_realtime = now
     end
 
-    local now = tonumber(globals.realtime)
-    if finite_number(now) then
-        frame_time = last_realtime and (now - last_realtime) or 0
-        last_realtime = now
+    local frame_time = tonumber(globals.frametime)
+    if not finite_number(frame_time) or frame_time <= 0 then
+        frame_time = realtime_delta
     end
     if not finite_number(frame_time) or frame_time <= 0 then
         return 0
@@ -176,6 +388,25 @@ do
         preset_controls[category][key] = control
         return control
     end
+    local function set_import_value(target, value)
+        if target == nil then return false end
+        local ok = pcall(target.set, target, value)
+        local read_ok, current = pcall(target.get, target)
+        if ok and read_ok and type(value) ~= "table" and current == value then
+            return true
+        end
+        if type(value) == "string" then
+            local list_ok, items = pcall(target.list, target)
+            if list_ok and type(items) == "table" then
+                for index, item in ipairs(items) do
+                    if item == value then
+                        return pcall(target.set, target, index)
+                    end
+                end
+            end
+        end
+        return ok
+    end
     preset_manager.encode = function(value)
         local ok, encoded = pcall(json.stringify, value)
         if not ok then return false, "Invalid JSON" end
@@ -192,18 +423,20 @@ do
     end
 
     preset_manager.decode = function(value)
+        if type(value) ~= "string" or value == "" then
+            return false, "Preset is empty!"
+        end
         local name, cheat, encoded = value:match("^(%w+)::(%w+)::(.+)$")
+        if not name or not cheat or not encoded then
+            return false, "Preset format is invalid!"
+        end
         if name ~= string.lower(config.name) then
             return false, "Preset not supported!"
         elseif cheat ~= string.lower(config.cheat) then
             return false, "Preset for another cheat!"
         end
 
-        encoded = encoded:gsub("[%g2134%g2634%_]", {
-            g2634 = "/",
-            g2134 = "+",
-            _ = "="
-        })
+        encoded = encoded:gsub("g2634", "/"):gsub("g2134", "+"):gsub("_", "=")
 
         local ok, decoded = pcall(base64.decode, encoded)
         if not ok then return false, "Invalid BASE64" end
@@ -220,35 +453,33 @@ do
         else
             local imported_count = 0;
             for category, controls in pairs(import) do
-                local target_category = category == "Aimbot" and "Rage" or category
-                local target_controls = preset_controls[target_category] or preset_controls[category]
-                if target_controls ~= nil then
-                    if category == "Anti-Aim" and controls["auto_lc.states"] ~= nil and controls["auto_lc.enabled"] == nil then
-                        local legacy_states = controls["auto_lc.states"]
-                        local enabled = type(legacy_states) == "table" and #legacy_states > 0
-                        local enabled_control = target_controls["auto_lc.enabled"]
-                        if enabled_control then
-                            pcall(enabled_control.set, enabled_control, enabled)
-                        end
-                    end
-
-                    for control, control_value in pairs(controls) do
-                        local target = target_controls[control]
-                        if target ~= nil then
-                            if target:type() == "color_picker" then
-                                local converted = import_color(control_value)
-                                if converted ~= nil then
-                                    control_value = converted
-                                else
+                if type(category) == "string" and type(controls) == "table" then
+                    local target_category = category == "Aimbot" and "Rage" or category
+                    local target_controls = preset_controls[target_category] or preset_controls[category]
+                    if target_controls ~= nil then
+                        local category_imported = false
+                        for control, control_value in pairs(controls) do
+                            local target = target_controls[control]
+                            if target ~= nil then
+                                local type_ok, target_type = pcall(target.type, target)
+                                if type_ok and target_type == "color_picker" then
+                                    local converted = import_color(control_value)
+                                    if converted ~= nil then
+                                        control_value = converted
+                                    else
+                                        target = nil
+                                    end
+                                elseif not type_ok then
                                     target = nil
                                 end
-                            end
-                            if target ~= nil then
-                                pcall(target.set, target, control_value)
+                                if target ~= nil then
+                                    local applied = set_import_value(target, control_value)
+                                    category_imported = applied or category_imported
+                                end
                             end
                         end
+                        if category_imported then imported_count = imported_count + 1 end
                     end
-                    imported_count = imported_count + 1
                 end
             end;
             return true, imported_count;
@@ -279,7 +510,7 @@ local refs = {
             hide_shots_options = ui.find("Aimbot", "Ragebot", "Main", "Hide Shots", "Options"),
             double_tap = ui.find("Aimbot", "Ragebot", "Main", "Double Tap"),
             double_tap_lag_options = ui.find("Aimbot", "Ragebot", "Main", "Double Tap", "Lag Options"),
-            double_tap_fake_lag_limit = ui.find("Aimbot", "Ragebot", "Main", "Double Tap", "Fake Lag Limit"),
+            double_tap_immediate_teleport = ui.find("Aimbot", "Ragebot", "Main", "Double Tap", "Immediate Teleport"),
             peek_assist = {
                 ui.find("Aimbot", "Ragebot", "Main", "Peek Assist"),
                 ui.find("Aimbot", "Ragebot", "Main", "Peek Assist", "Style"),
@@ -323,11 +554,6 @@ local refs = {
             extended_angles = ui.find("Aimbot", "Anti Aim", "Angles", "Extended Angles"),
             extended_pitch = ui.find("Aimbot", "Anti Aim", "Angles", "Extended Angles", "Extended Pitch"),
             extended_roll = ui.find("Aimbot", "Anti Aim", "Angles", "Extended Angles", "Extended Roll")
-        },
-        fake_lag = {
-            enabled = ui.find("Aimbot", "Anti Aim", "Fake Lag", "Enabled"),
-            limit = ui.find("Aimbot", "Anti Aim", "Fake Lag", "Limit"),
-            variability = ui.find("Aimbot", "Anti Aim", "Fake Lag", "Variability")
         },
         misc = {
             fake_duck = ui.find("Aimbot", "Anti Aim", "Misc", "Fake Duck"),
@@ -640,6 +866,7 @@ do
             "Visuals", "transparent.enabled",
             home_containers.profile:switch(concat(pad_spaces(3), icon_label("eye"), pad_spaces(7), "Transparent"), false)
         )
+        home_containers.profile:button("Export Shot Log (JSON)", shot_diag_export, true)
 
         builtin_ui.header = home_containers.presets:label(section_label("Presets"))
         presets_ui.list = home_containers.presets:list("##presets.list", {})
@@ -693,6 +920,20 @@ do
         [4] = "Sneaking"
     }));
     presets_tab.flick_exploit = preset_list;
+    local auto_hide_shots = {}
+    auto_hide_shots.enabled = preset_manager.push("Anti-Aim", "auto_hide_shots.enabled",
+        antiaim_tabs.tweaks:switch(concat(pad_spaces(2), icon_label("water-ladder"), pad_spaces(7), "Auto Hide Shots"), false))
+    local auto_hide_gear = auto_hide_shots.enabled:create()
+    auto_hide_shots.states = preset_manager.push("Anti-Aim", "auto_hide_shots.states",
+        auto_hide_gear:selectable("States", {"Standing", "Crouching", "Sneaking"}))
+    auto_hide_shots.weapons = preset_manager.push("Anti-Aim", "auto_hide_shots.weapons",
+        auto_hide_gear:selectable("Weapons", {"SMG", "Rifles", "Pistols", "SSG-08", "AWP", "Auto Snipers", "Desert Eagle"}))
+    auto_hide_shots.states:set({"Standing", "Crouching", "Sneaking"})
+    auto_hide_shots.weapons:set({"SMG", "Rifles", "Pistols", "SSG-08", "AWP", "Auto Snipers", "Desert Eagle"})
+    auto_hide_shots.enabled:set_callback(function()
+        auto_hide_gear:visibility(auto_hide_shots.enabled:get())
+    end, true)
+    presets_tab.auto_hide_shots = auto_hide_shots;
     local builtin_presets = {
         enabled = preset_manager.push("Anti-Aim", "safe_head.enabled", antiaim_tabs.tweaks:switch(concat(pad_spaces(2), icon_label("face-head-bandage"), pad_spaces(7), "Safe Head")))
     };
@@ -739,46 +980,11 @@ do
         update_anim_breaker_visibility();
     end;
     presets_tab.anim_breaker = anim_breaker;
-    source_controls.lc_enabled=preset_manager.push("Anti-Aim","auto_lc.enabled",antiaim_tabs.tweaks:switch(concat(pad_spaces(3),icon_label("bolt"),pad_spaces(7),"Auto LC"),true))
-    local lc_group = source_controls.lc_enabled:create();
-    source_controls.lc_mode=preset_manager.push("Anti-Aim","auto_lc.mode",lc_group:combo("Air Teleport",{"On enemy","Exploit"}))
-    source_controls.lc_on_cross=preset_manager.push("Anti-Aim","auto_lc.on_cross",lc_group:switch("Allow on cross",true))
-    source_controls.lc_weapons=preset_manager.push("Anti-Aim","auto_lc.weapons",lc_group:selectable("Weapons",{"AWP","SSG 08","Taser"}))
-    ensure_defaults(source_controls.lc_weapons)
-    source_controls.lc_exploit_ticks=preset_manager.push("Anti-Aim","auto_lc.exploit_ticks",lc_group:slider("Exploit ticks",10,30,10,1,"t"))
-    do
-        local function update_lc_visibility()
-            local mode = source_controls.lc_mode:get();
-            lc_group:visibility(source_controls.lc_enabled:get());
-            source_controls.lc_on_cross:visibility(mode == "On enemy");
-            source_controls.lc_weapons:visibility(mode == "On enemy");
-            source_controls.lc_exploit_ticks:visibility(mode == "Exploit");
-        end;
-        source_controls.lc_mode:set_callback(update_lc_visibility, true);
-        source_controls.lc_enabled:set_callback(update_lc_visibility, true);
-        update_lc_visibility();
-    end;
-    source_controls.exploit_backtrack = preset_manager.push("Rage", "exploit_backtrack.enabled", antiaim_tabs.tweaks:switch(concat(pad_spaces(3), icon_label("rewind"), pad_spaces(7), "Exploit Backtrack"), false))
-    source_controls.exploit_backtrack_status = "off"
-    source_controls.adaptive_fakelags = preset_manager.push("Rage", "adaptive_fakelags.enabled", antiaim_tabs.tweaks:switch(concat(pad_spaces(3), icon_label("activity"), pad_spaces(7), "Adaptive Fake Lags"), false))
-    source_controls.predict_uncharge = preset_manager.push("Rage", "predict_uncharge.enabled", antiaim_tabs.tweaks:switch(concat(pad_spaces(3), icon_label("crosshair"), pad_spaces(7), "Predict Exploit Uncharge"), false))
-    source_controls.predict_uncharge_status = "off"
     home_icon.tweaks = presets_tab;
     local presets_ui = {};
     local presets_db_key = {
         enabled = preset_manager.push("Anti-Aim", "freestanding.enabled", antiaim_tabs.hotkeys:switch(concat(pad_spaces(2), icon_label("compass"), pad_spaces(7), "Freestanding")))
     };
-    local saved_presets = presets_db_key.enabled:create();
-    presets_db_key.static = preset_manager.push("Anti-Aim", "freestanding.static", saved_presets:switch("Static Freestanding"));
-    presets_db_key.disablers = preset_manager.push("Anti-Aim", "freestanding.disablers", saved_presets:selectable("Disablers", {
-        [1] = "Standing",
-        [2] = "Running",
-        [3] = "Walking",
-        [4] = "Crouching",
-        [5] = "Sneaking",
-        [6] = "In Air",
-        [7] = "Air Crouch"
-    }));
     presets_ui.freestanding = presets_db_key;
     local saved_presets = {
         direction = preset_manager.push("Anti-Aim", "manual_yaw.direction", antiaim_tabs.hotkeys:combo(concat(pad_spaces(2), icon_label("arrows-left-right"), pad_spaces(7), "Manual Yaw"), {
@@ -1036,28 +1242,24 @@ do
                 data2 = value25;
                 success = ok2;
                 if not success then
-                    print("failed 1");
                     return;
                 else
                     ok2, value25 = pcall(base64.decode, data2);
                     data2 = value25;
                     success = ok2;
                     if not success then
-                        print("failed 2");
                         return;
                     else
                         ok2, value25 = pcall(json.parse, data2);
                         data2 = value25;
                         success = ok2;
                         if not success then
-                            print("failed 3");
                             return;
                         else
                             ok2 = builtin_presets.team:get();
                             value25 = builtin_presets.state:get();
                             local value26 = builtin_presets[ok2][value25];
                             if value26 == nil then
-                                print("failed 4");
                                 return;
                             else
                                 apply_state_values(value26, data2);
@@ -1095,7 +1297,7 @@ do
         presets_db_key();
         ui_controls.antiaim = home_icon;
     end;
-    local home_containers = {};
+    local home_containers = {}
     local antiaim_tabs = icons.get("send-backward");
     local presets_tab = {
         category = ui.create(antiaim_tabs, "##category", 1),
@@ -1140,7 +1342,232 @@ do
         end, true)
     end
     source_controls.extrap=preset_manager.push("Miscellaneous","source.extrapolation",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("arrows-left-right"),pad_spaces(7),"Extrapolation"),false))
-    source_controls.force=preset_manager.push("Miscellaneous","source.force_interpolation",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("arrows-rotate"),pad_spaces(7),"Force Interpolation"),false))
+
+    source_controls.resolver_assist=preset_manager.push("Miscellaneous","source.resolver_assist",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("crosshairs"),pad_spaces(7),"Correction"),false))
+    source_controls.force=preset_manager.push("Miscellaneous","source.force_interpolation",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("arrows-rotate"),pad_spaces(7),"Interpolation"),false))
+    source_controls.force_shot=preset_manager.push("Miscellaneous","source.force_shot",presets_tab.aimbot:switch(concat(pad_spaces(2),icon_label("crosshairs"),pad_spaces(7),"Force Shot"),false))
+
+    do
+        local pointscale = {}
+        pointscale.enabled = preset_manager.push("Rage", "pointscale.enabled",
+            presets_tab.aimbot:switch(concat(pad_spaces(2), icon_label("crosshairs"), pad_spaces(8), "Pointscale"), true))
+        source_controls.pointscale_enabled = pointscale.enabled
+
+        local gear = pointscale.enabled:create()
+        pointscale.automatic = preset_manager.push("Rage", "pointscale.automatic",
+            gear:switch(concat(icon_label("wand-sparkles"), " Automatic"), true))
+        pointscale.head_min = preset_manager.push("Rage", "pointscale.head_min", gear:slider("Head Min", 0, 100, 40, 1))
+        pointscale.head_max = preset_manager.push("Rage", "pointscale.head_max", gear:slider("Head Max", 0, 100, 100, 1))
+        pointscale.body_min = preset_manager.push("Rage", "pointscale.body_min", gear:slider("Body Min", 0, 100, 40, 1))
+        pointscale.body_max = preset_manager.push("Rage", "pointscale.body_max", gear:slider("Body Max", 0, 100, 100, 1))
+
+        local head_scale = refs.rage.selection.multipoint_scale[1]
+        local body_scale = refs.rage.selection.multipoint_scale[2]
+        local motion_cache = {}
+        local function clamp_scale(value, low, high)
+            value = tonumber(value) or low
+            low = tonumber(low) or 0
+            high = tonumber(high) or 100
+            if low > high then low, high = high, low end
+            return math.max(low, math.min(high, value))
+        end
+        local function finite_scale(value)
+            return type(value) == "number" and value == value and math.abs(value) < math.huge
+        end
+        local function scale_percent(value, max_speed)
+            if not finite_scale(max_speed) or max_speed <= 0 then return 0 end
+            return math.floor(math.max(0, math.min(100, value / max_speed * 100)))
+        end
+        local function automatic_scales(threat)
+            local velocity = threat.m_vecVelocity
+            local vx = velocity and tonumber(velocity.x) or 0
+            local vy = velocity and tonumber(velocity.y) or 0
+            if not finite_scale(vx) then vx = 0 end
+            if not finite_scale(vy) then vy = 0 end
+            local speed = math.sqrt(vx * vx + vy * vy)
+
+            local flags = tonumber(threat.m_fFlags) or 0
+            local grounded = bit.band(flags, 1) ~= 0
+            local weapon, max_speed, scoped
+            pcall(function()
+                weapon = threat:get_player_weapon()
+                if weapon then
+                    local info = weapon:get_weapon_info()
+                    if info then
+                        scoped = threat.m_bIsScoped == true
+                        max_speed = tonumber(scoped and info.max_player_speed_alt or info.max_player_speed)
+                    end
+                end
+            end)
+            if not finite_scale(max_speed) or max_speed <= 0 then max_speed = 250 end
+
+            local duck_amount = tonumber(threat.m_flDuckAmount) or 0
+            duck_amount = math.max(0, math.min(1, duck_amount))
+            local index = threat:get_index()
+            local spawn_time = 0
+            pcall(function() spawn_time = tonumber(threat.m_flSpawnTime) or 0 end)
+            local cache_key = tostring(index) .. ":" .. tostring(spawn_time)
+            local old = motion_cache[cache_key]
+            local now = tonumber(globals.realtime) or 0
+            local dt = old and now - (tonumber(old.time) or now) or 0
+            if not finite_scale(dt) or dt < 0 or dt > 0.35 then
+                -- A long sampling gap invalidates both the derivative and the
+                -- smoothing history; do not carry stale acceleration forward.
+                dt = 0
+                old = nil
+            end
+
+            local raw_movement = scale_percent(speed, max_speed)
+            local movement = raw_movement
+            local acceleration = 0
+            if old and dt >= 0.005 then
+                local dx, dy = vx - (tonumber(old.vx) or vx), vy - (tonumber(old.vy) or vy)
+                local raw_acceleration = math.sqrt(dx * dx + dy * dy) / dt
+                if finite_scale(raw_acceleration) then
+                    acceleration = (tonumber(old.acceleration) or raw_acceleration) * 0.70
+                        + math.min(raw_acceleration, 1800) * 0.30
+                end
+            elseif old then
+                acceleration = tonumber(old.acceleration) or 0
+            end
+            if not finite_scale(acceleration) then acceleration = 0 end
+
+            if type(social_enemy_prediction) == "function" then
+                local prediction_ok, forecast = pcall(social_enemy_prediction, threat)
+                if prediction_ok and type(forecast) == "table" and forecast.velocity
+                    and forecast.collision ~= true and (tonumber(forecast.samples) or 0) >= 4
+                    and (tonumber(forecast.divergence) or math.huge) <= 6
+                    and (tonumber(forecast.acceleration) or math.huge) <= 1800 then
+                    local pvx, pvy = tonumber(forecast.velocity.x), tonumber(forecast.velocity.y)
+                    if finite_scale(pvx) and finite_scale(pvy) then
+                        local predicted_speed = math.sqrt(pvx * pvx + pvy * pvy)
+                        if finite_scale(predicted_speed) and predicted_speed <= max_speed * 1.25 then
+                            local predicted_movement = scale_percent(predicted_speed, max_speed)
+                            movement = raw_movement * 0.75 + predicted_movement * 0.25
+                        end
+                    end
+                end
+            end
+
+            local state_changed = old and old.grounded ~= grounded
+            if old and dt > 0 then
+                local movement_alpha = math.max(0.12, math.min(state_changed and 0.68 or 0.48, dt / 0.09))
+                movement = (tonumber(old.movement) or movement) * (1 - movement_alpha)
+                    + movement * movement_alpha
+            end
+            movement = clamp_scale(movement, 0, 100)
+
+            local local_player = entity.get_local_player()
+            local distance = 1000
+            pcall(function()
+                if local_player then distance = (local_player:get_origin() - threat:get_origin()):length() end
+            end)
+            if not finite_scale(distance) then distance = 1000 end
+            local close_factor = math.max(0, math.min(1, (900 - distance) / 700))
+            local accel_penalty = math.max(0, math.min(9, acceleration / 150))
+            local air_bonus = grounded and 0 or 9
+            local scope_bonus = scoped and 2 or 0
+            local crouch_tighten = duck_amount * (grounded and 10 or 5)
+
+            local head = 91 - movement * 0.25 - air_bonus - accel_penalty
+                + close_factor * 3 + scope_bonus - crouch_tighten
+            local body = 66 + movement * 0.18 + air_bonus + accel_penalty * 0.45
+                + duck_amount * 4 - close_factor * 2
+            head, body = clamp_scale(head, 54, 94), clamp_scale(body, 58, 92)
+
+            local previous_head = old and tonumber(old.head) or nil
+            local previous_body = old and tonumber(old.body) or nil
+            if previous_head and previous_body and dt > 0 then
+                local output_alpha = math.max(0.20, math.min(state_changed and 0.72 or 0.50, dt / 0.075))
+                local next_head = previous_head + (head - previous_head) * output_alpha
+                local next_body = previous_body + (body - previous_body) * output_alpha
+                local max_step = state_changed and 10 or 5
+                head = previous_head + clamp_scale(next_head - previous_head, -max_step, max_step)
+                body = previous_body + clamp_scale(next_body - previous_body, -max_step, max_step)
+            end
+
+            motion_cache[cache_key] = {
+                vx = vx, vy = vy, time = now, acceleration = acceleration,
+                movement = movement, head = head, body = body, grounded = grounded
+            }
+            for id, sample in pairs(motion_cache) do
+                local sample_time = tonumber(sample.time)
+                if not sample_time or not finite_scale(sample_time) or now < sample_time
+                    or now - sample_time > 0.5 then
+                    motion_cache[id] = nil
+                end
+            end
+            return head, body
+        end
+        local function update_pointscale_visibility()
+            local automatic = pointscale.automatic:get()
+            pointscale.head_min:visibility(not automatic)
+            pointscale.head_max:visibility(not automatic)
+            pointscale.body_min:visibility(not automatic)
+            pointscale.body_max:visibility(not automatic)
+        end
+        pointscale.automatic:set_callback(update_pointscale_visibility, true)
+        pointscale.enabled:set_callback(function()
+            gear:visibility(pointscale.enabled:get())
+        end, true)
+
+        local function apply_pointscale()
+            if not pointscale.enabled:get() then
+                head_scale:override(nil)
+                body_scale:override(nil)
+                return
+            end
+            local ok, threat = pcall(entity.get_threat, true)
+            if not ok or not threat then
+
+                head_scale:override(nil)
+                body_scale:override(nil)
+                return
+            end
+            local ok_values, head_value, body_value = pcall(function()
+                if pointscale.automatic:get() then
+                    return automatic_scales(threat)
+                end
+                local velocity = threat.m_vecVelocity
+                local speed = velocity and math.floor(velocity:length2d()) or 0
+                local flags = tonumber(threat.m_fFlags) or 0
+                local weapon = threat:get_player_weapon()
+                local max_speed = 250
+                if weapon then
+                    local info = weapon:get_weapon_info()
+                    if info then
+                        local scoped = threat.m_bIsScoped == true
+                        max_speed = tonumber(scoped and info.max_player_speed_alt or info.max_player_speed) or max_speed
+                    end
+                end
+                if max_speed <= 0 then max_speed = 250 end
+                local more = scale_percent(speed, max_speed)
+                local less = 100 - more
+                local hmax, hmin = pointscale.head_max:get(), pointscale.head_min:get()
+                local bmax, bmin = pointscale.body_max:get(), pointscale.body_min:get()
+                local partial_ground = bit.band(flags, 256) ~= 0
+                if partial_ground then
+                    return clamp_scale(more, hmin, hmax), clamp_scale(less, bmin, bmax)
+                end
+                return clamp_scale(less, hmin, hmax), clamp_scale(more, bmin, bmax)
+            end)
+            if ok_values then
+                head_scale:override(head_value)
+                body_scale:override(body_value)
+            else
+                head_scale:override(nil)
+                body_scale:override(nil)
+            end
+        end
+        events.createmove(apply_pointscale)
+        events.shutdown(function()
+            head_scale:override(nil)
+            body_scale:override(nil)
+            motion_cache = {}
+        end)
+        events.level_init(function() motion_cache = {} end)
+    end
+
     do
         local preset_list = {};
         if config.build ~= "Live" then
@@ -1214,27 +1641,6 @@ do
                 end;
                 container.enabled:set_callback(on_toggle, true);
                 preset_list.maxusrcmdprocessticks = container;
-            end;
-            do
-                local lag_disablers = {
-                    enabled = preset_manager.push("Rage", "lag_disablers.enabled", presets_tab.aimbot:switch(concat(pad_spaces(2), icon_label("wand-magic-sparkles"), pad_spaces(7), "Lag Disablers")))
-                };
-                local lag_group = lag_disablers.enabled:create();
-                lag_disablers.states = preset_manager.push("Rage", "lag_disablers.states", lag_group:selectable("States", {
-                    [1] = "Stand",
-                    [2] = "DT Knife",
-                    [3] = "DT Revolver",
-                    [4] = "DT Discharge"
-                }));
-                lag_disablers.states:tooltip("Temporarily disables Fake Lag in the selected situations.");
-                do
-                    local function update_lag_disablers(control)
-                        lag_group:visibility(control:get());
-                    end;
-                    lag_disablers.enabled:set_callback(update_lag_disablers, true);
-                    update_lag_disablers(lag_disablers.enabled);
-                end;
-                preset_list.lag_disablers = lag_disablers;
             end;
             preset_list.fake_latency = {
                 enabled = preset_manager.push("Rage", "fake_latency.enabled", presets_tab.aimbot:switch(concat(pad_spaces(2), icon_label("satellite-dish"), pad_spaces(7), "Unlock Fake Latency")))
@@ -1386,7 +1792,6 @@ do
             world_modulate.bloom = preset_manager.push("Visuals", "world_modulate.bloom", world_group:slider("Bloom", 0, 100, 0, 1, percent_label));
             world_modulate.exposure = preset_manager.push("Visuals", "world_modulate.exposure", world_group:slider("Exposure", 0, 100, 0, 1, percent_label));
             world_modulate.model_brightness = preset_manager.push("Visuals", "world_modulate.model_brightness", world_group:slider("Model brightness", 0, 200, 0, 1, percent_label));
-            world_modulate.enabled:tooltip("Bloom, exposure and model brightness. Model transparency is handled by the existing Keep Transparency option.");
             do
                 local function update_world_visibility(control)
                     world_group:visibility(control:get());
@@ -1456,17 +1861,39 @@ do
 end;
 
 local player_state = {
+    valid = false,
     is_moving = false,
     is_onground = false,
     is_crouched = false
 };
+
 local function update_player_state(cmd)
     local player = entity.get_local_player()
-    if not player then return end
+    if not player then
+        player_state.valid = false
+        player_state.is_onground = false
+        player_state.is_moving = false
+        player_state.is_crouched = false
+        return
+    end
 
-    player_state.is_onground = bit.band(player.m_fFlags, 1) ~= 0
-    player_state.is_moving = player.m_vecVelocity:length2dsqr() > 25
-    player_state.is_crouched = player.m_flDuckAmount > 0.5 or cmd.in_duck == true
+    local flags = tonumber(player.m_fFlags) or 0
+    local velocity = player.m_vecVelocity
+    local speed_sqr = 0
+    pcall(function()
+        if velocity then speed_sqr = velocity:length2dsqr() end
+    end)
+
+    local duck_amount = tonumber(player.m_flDuckAmount) or 0
+    local duck_cmd = cmd and (cmd.in_duck == true or cmd.in_duck == 1)
+    local fake_duck = false
+    pcall(function() fake_duck = refs.antiaim.misc.fake_duck:get() == true end)
+    player_state.valid = true
+    player_state.is_onground = bit.band(flags, 1) ~= 0
+    local was_moving = player_state.is_moving == true
+
+    player_state.is_moving = speed_sqr > (was_moving and 16 or 36)
+    player_state.is_crouched = bit.band(flags, 2) ~= 0 or duck_amount > 0.15 or duck_cmd or fake_duck
 end;
 events.createmove(update_player_state);
 
@@ -1529,12 +1956,70 @@ do
     end;
     local function update_state_stack()
         clear_states();
+        if not player_state.valid then return end
         push_ground_states();
         push_duck_states();
         push_air_states();
     end;
     events.createmove(update_state_stack);
 end;
+
+do
+    local active = false
+    local function release()
+        if not active then return end
+        pcall(function() refs.rage.main.hide_shots:override() end)
+        pcall(function() refs.rage.main.double_tap:override() end)
+        active = false
+    end
+
+    local function weapon_group(weapon)
+        local info = weapon and weapon:get_weapon_info()
+        if not info then return nil end
+        local kind = tonumber(info.weapon_type)
+        local index = tonumber(weapon:get_weapon_index())
+        if kind == 2 then return "SMG" end
+        if kind == 3 then return "Rifles" end
+        if kind == 1 then return index == 1 and "Desert Eagle" or "Pistols" end
+        if kind == 5 then
+            if index == 40 then return "SSG-08" end
+            if index == 9 then return "AWP" end
+            return "Auto Snipers"
+        end
+        return nil
+    end
+
+    local function update_auto_hide_shots()
+        local cfg = ui_controls.antiaim and ui_controls.antiaim.tweaks
+            and ui_controls.antiaim.tweaks.auto_hide_shots
+        if not cfg or not cfg.enabled:get() then release(); return end
+        if refs.antiaim.misc.fake_duck:get() or not refs.rage.main.double_tap:get() then
+            release()
+            return
+        end
+
+        local me = entity.get_local_player()
+        if not me or not me:is_alive() then release(); return end
+        local weapon = me:get_player_weapon()
+        local group = weapon_group(weapon)
+        local state = state_context.get()
+        if not group or not state or not cfg.weapons:get(group) or not cfg.states:get(state) then
+            release()
+            return
+        end
+
+        active = true
+        local ok = pcall(function()
+            refs.rage.main.hide_shots:override(true)
+            refs.rage.main.double_tap:override(false)
+        end)
+        if not ok then release() end
+    end
+
+    events.createmove(update_auto_hide_shots)
+    events.level_init(release)
+    events.shutdown(release)
+end
 
 local team_info = {
     get = function()
@@ -1554,7 +2039,8 @@ local team_info = {
     end
 };
 
-local aa_patch={owner=nil,packet_cmd=nil,hidden_cmd=nil,command=nil,draws={},hidden_owned=false}
+local aa_patch={owner=nil,packet_cmd=nil,hidden_cmd=nil,command=nil,draws={},hidden_owned=false,
+    defensive_switch_phase=false,defensive_switch_cmd=nil,defensive_switch_profile=nil}
 local function aa_rand(tag,a,b)
     a,b=math.ceil(math.min(a,b)),math.floor(math.max(a,b))
     local key=tag..":"..tostring(a)..":"..tostring(b)
@@ -1591,15 +2077,17 @@ local counter = 0;
 local angles_state = {};
 local angle_refs = refs.antiaim.angles;
 local function unset_override(arg65)
-    arg65:override(nil);
+    if arg65 == nil then return false end
+    local ok = pcall(function() arg65:override(nil) end)
+    return ok
 end;
 local function set_override(arg66, ...)
-    if ... == nil then
-        return;
-    else
-        arg66:override(...);
-        return;
-    end;
+    local value = ...
+    if value == nil or arg66 == nil then return false end
+    local ok, current = pcall(function() return arg66:get() end)
+    if ok and current ~= nil and type(current) ~= type(value) then return false end
+    local applied = pcall(function() arg66:override(value) end)
+    return applied
 end;
 local state_meta = {};
 state_meta.__index = state_meta;
@@ -1680,7 +2168,7 @@ do
     end;
     setmetatable(angles_state, state_meta);
 end;
-local angle_refs = {};
+
 local unset_override = false;
 local set_override = false;
 local state_meta = function(lerp, arg68, arg69)
@@ -1708,7 +2196,7 @@ do
                 return (state_meta(from_value, to_value, value38 % 1));
             elseif method5 == "Sway" then
                 local value39 = globals.curtime * 5;
-                return (state_meta(from_value, to_value, math.sin(value39) % 1));
+                return (state_meta(from_value, to_value, (math.sin(value39) + 1) * 0.5));
             else
                 return 0;
             end;
@@ -1739,10 +2227,16 @@ do
                 return offset2;
             elseif apply_modifier2 == "Switch" then
                 local profile=tostring(arg71)..":"..from_value2..":"..to_value2
-                if aa_patch.switch_cmd~=_6.command_number or aa_patch.switch_profile~=profile then
-                    aa_patch.switch_cmd=_6.command_number;aa_patch.switch_profile=profile;aa_patch.switch_phase=switch_state
+                if aa_patch.defensive_switch_profile~=profile then
+                    aa_patch.defensive_switch_profile=profile
+                    aa_patch.defensive_switch_phase=false
+                    aa_patch.defensive_switch_cmd=nil
                 end
-                local yaw=aa_patch.switch_phase and from_value2 or to_value2
+                if _6.choked_commands==0 and aa_patch.defensive_switch_cmd~=_6.command_number then
+                    aa_patch.defensive_switch_cmd=_6.command_number
+                    aa_patch.defensive_switch_phase=not aa_patch.defensive_switch_phase
+                end
+                local yaw=aa_patch.defensive_switch_phase and from_value2 or to_value2
                 if variation>0 then yaw=yaw+math.ceil(aa_rand("hidden jitter",-variation,variation)/2) end
                 return math.clamp(yaw,-180,180);
             elseif apply_modifier2 == "Random" then
@@ -1766,7 +2260,7 @@ do
             elseif apply_modifier2 == "Sway" then
                 local value44 = globals.curtime * speed * 0.1;
                 local value45 = offset2 * 0.5;
-                local value46 = state_meta(-value45, value45, math.sin(value44) % 1);
+                local value46 = state_meta(-value45, value45, (math.sin(value44) + 1) * 0.5);
                 angles_state.body_yaw = "Left";
                 return value46;
             else
@@ -1795,7 +2289,15 @@ do
                 flip_switch();
             end;
         end;
-        angle_refs.reset = function() unset_override=false;aa_patch.hidden_cmd=nil;aa_patch.switch_cmd=nil;aa_patch.switch_profile=nil end
+        angle_refs.reset = function()
+            unset_override=false
+            aa_patch.hidden_cmd=nil
+            aa_patch.switch_cmd=nil
+            aa_patch.switch_profile=nil
+            aa_patch.defensive_switch_cmd=nil
+            aa_patch.defensive_switch_profile=nil
+            aa_patch.defensive_switch_phase=false
+        end
         angle_refs.apply = function(self2, arg76, arg77)
             local is_double_tap = rage.exploit:get() == 1;
             local fake_duck = refs.antiaim.misc.fake_duck:get();
@@ -1816,26 +2318,50 @@ do
     local unset_override = {};
     local set_override = ui_controls.antiaim.builder;
     local state_meta = function(reset_pitch)
+
         angles_state.pitch = "Down";
         angles_state.hidden = false;
     end;
     local function apply_yaw(arg78)
         angles_state.yaw = "Backward";
         angles_state.yaw_base = "At Target";
-        angles_state.yaw_offset = arg78.yaw_offset:get();
-        angles_state.yaw_add = arg78.yaw_add:get();
-        angles_state.yaw_left = arg78.yaw_left:get();
-        angles_state.yaw_right = arg78.yaw_right:get();
+        local base = tonumber(arg78.yaw_offset:get()) or 0
+        local add_enabled = arg78.yaw_add:get() == true
+        local left = tonumber(arg78.yaw_left:get()) or 0
+        local right = tonumber(arg78.yaw_right:get()) or 0
+        local body_mode = arg78.body_yaw:get()
+        local side_offset = 0
+        if add_enabled then
+            if body_mode == "Left" then
+                side_offset = left
+            elseif body_mode == "Right" then
+                side_offset = right
+            elseif body_mode == "Jitter" or body_mode == "Randomize Jitter" then
+                side_offset = switch_state and left or right
+            end
+        end
+        base = math.clamp(base, -180, 180)
+        side_offset = math.clamp(side_offset, -180, 180)
+        angles_state.yaw_offset_base = base
+        angles_state.yaw_offset = math.normalize_yaw(base + side_offset)
+        angles_state.yaw_add = add_enabled
+        angles_state.yaw_left = left
+        angles_state.yaw_right = right
     end;
     local function apply_modifier(arg79)
-        angles_state.yaw_modifier = arg79.yaw_modifier:get();
-        angles_state.modifier_offset = arg79.modifier_offset:get();
+        local mode = arg79.yaw_modifier:get()
+        local offset = tonumber(arg79.modifier_offset:get()) or 0
+        angles_state.yaw_modifier = mode
+        angles_state.modifier_offset_base = math.clamp(offset, -180, 180)
+        angles_state.modifier_offset = angles_state.modifier_offset_base
     end;
     local function apply_body_yaw(arg80)
         angles_state.body_yaw = arg80.body_yaw:get();
         angles_state.inverter = false;
-        angles_state.left_limit = arg80.left_limit:get();
-        angles_state.right_limit = arg80.right_limit:get();
+        angles_state.left_limit_base = tonumber(arg80.left_limit:get()) or 0;
+        angles_state.right_limit_base = tonumber(arg80.right_limit:get()) or 0;
+        angles_state.left_limit = angles_state.left_limit_base;
+        angles_state.right_limit = angles_state.right_limit_base;
         angles_state.options = {};
         angles_state.freestanding_body_yaw = "Off";
         angles_state.delay_1 = arg80.delay_1:get();
@@ -1851,7 +2377,9 @@ do
     end;
     do
         unset_override.get = function(self3, arg81, arg82)
-            return set_override[arg81][arg82];
+            local team_profiles = set_override[arg81]
+            if team_profiles == nil then return nil end
+            return team_profiles[arg82]
         end;
         unset_override.is_active_ex = function(self4, arg83)
             if arg83.angles == nil then
@@ -2215,17 +2743,8 @@ do
     local apply_freestanding = {};
     local apply_extended = ui_controls.antiaim.hotkeys.freestanding;
     do
-        local function is_static()
-            return apply_extended.static:get()
-        end
-        local function is_disabled()
-            local state = state_context.get()
-            return state ~= nil and apply_extended.disablers:get(state) or false
-        end
         apply_freestanding.update = function(self16)
             if not apply_extended.enabled:get() then
-                return false;
-            elseif is_disabled() then
                 return false;
             else
                 angles_state.enabled = true;
@@ -2242,18 +2761,7 @@ do
                 angles_state.body_yaw = angles_state.body_yaw ~= "Disabled";
                 angles_state.inverter = nil;
                 angles_state.options = {};
-                local wall=aa_patch.wall and aa_patch.wall()
-                if wall and is_static() then
-                    local wall_offset=math.normalize_yaw(wall-render.camera_angles().y-180)
 
-                    if math.abs(wall_offset) > 5 then
-                        angles_state.yaw_base="Local View"
-                        angles_state.yaw_offset=wall_offset
-                        angles_state.freestanding=false
-                        angles_state.body_freestanding=false
-                        angles_state.freestanding_body_yaw="Off"
-                    end
-                end
                 return true;
             end;
         end;
@@ -2298,29 +2806,63 @@ do
         end;
     end;
     local manual_yaw = function(cmd)
-        if aa_patch.packet_cmd==cmd.command_number then return end
-        aa_patch.packet_cmd=cmd.command_number
-        if rage.exploit:get() == 0 then
-            switch_state = not switch_state;
-            return;
-        else
-            if angles_state.body_yaw == "Jitter" then
-                counter = angles_state.delay_1;
-            end;
-            if angles_state.body_yaw == "Randomize Jitter" and flags then
-                counter = aa_rand("body delay",angles_state.delay_1,angles_state.delay_2);
-                flags = false;
-            end;
-            tick_count = tick_count + 1;
-            if counter < tick_count then
-                switch_state = not switch_state;
-                tick_count = 0;
-                flags = true;
-            end;
-            return;
-        end;
+        if not cmd or aa_patch.packet_cmd == cmd.command_number then return end
+        aa_patch.packet_cmd = cmd.command_number
+
+        local body_mode = angles_state.body_yaw
+        local body_active = body_mode == "Jitter" or body_mode == "Randomize Jitter"
+        if not body_active then
+            tick_count, counter, flags = 0, 0, true
+            last_body_delay = nil
+            return
+        end
+
+        if flags then
+            local low = math.clamp(math.floor(tonumber(angles_state.delay_1) or 1), 1, 32)
+            local high = math.clamp(math.floor(tonumber(angles_state.delay_2) or low), low, 32)
+            if body_mode == "Randomize Jitter" then
+                counter = math.max(1, math.floor(aa_rand("body delay", low, high)))
+                if high > low and counter == last_body_delay then
+                    counter = counter >= high and low or counter + 1
+                end
+                last_body_delay = counter
+            elseif body_active then
+                counter = low
+            else
+                counter = 1
+            end
+            flags = false
+        end
+
+        tick_count = tick_count + 1
+        if tick_count >= math.max(1, counter) then
+            switch_state = not switch_state
+            tick_count = 0
+            flags = true
+            if body_mode == "Randomize Jitter" then
+                local left_value = tonumber(angles_state.left_limit_base) or tonumber(angles_state.left_limit) or 0
+                local right_value = tonumber(angles_state.right_limit_base) or tonumber(angles_state.right_limit) or 0
+                if not finite_number(left_value) then left_value = 0 end
+                if not finite_number(right_value) then right_value = 0 end
+                local left_base = math.clamp(left_value, 0, 60)
+                local right_base = math.clamp(right_value, 0, 60)
+                local left_min, left_max = math.floor(left_base * 0.75), math.floor(left_base)
+                local right_min, right_max = math.floor(right_base * 0.75), math.floor(right_base)
+                local next_left = aa_rand("body-left-limit", left_min, left_max)
+                local next_right = aa_rand("body-right-limit", right_min, right_max)
+                if left_max > left_min and next_left == aa_patch.body_jitter_left then
+                    next_left = next_left >= left_max and left_min or next_left + 1
+                end
+                if right_max > right_min and next_right == aa_patch.body_jitter_right then
+                    next_right = next_right >= right_max and right_min or next_right + 1
+                end
+                aa_patch.body_jitter_left, aa_patch.body_jitter_right = next_left, next_right
+            else
+                aa_patch.body_jitter_left, aa_patch.body_jitter_right = nil, nil
+            end
+        end
     end;
-    local offsets = function(update)
+    local resolve_anti_aim_mode = function(update)
         local active, value81 = unset_override:update();
         angle_refs:update(update);
         if apply_yaw:update() then
@@ -2344,41 +2886,10 @@ do
             return "builder";
         end;
     end;
-    local function update_flick()
-        if not angles_state.yaw_add then
-            return;
-        else
-            local value82 = switch_state and angles_state.yaw_left or angles_state.yaw_right;
-            angles_state.yaw_offset = angles_state.yaw_offset + value82;
-            return;
+    local function apply_manual_yaw(cmd)
+        if cmd.choked_commands == 0 then
+            manual_yaw(cmd);
         end;
-    end;
-    local function update_body_yaw()
-        if angles_state.body_yaw == "Disabled" then
-            angles_state.body_yaw = false;
-            return;
-        elseif angles_state.body_yaw == "Left" then
-            angles_state.body_yaw = true;
-            angles_state.inverter=false;
-            return;
-        elseif angles_state.body_yaw == "Right" then
-            angles_state.body_yaw = true;
-            angles_state.inverter=true;
-            return;
-        elseif angles_state.body_yaw == "Jitter" or angles_state.body_yaw == "Randomize Jitter" then
-            angles_state.body_yaw = true;
-            angles_state.inverter=switch_state;
-            return;
-        else
-            return;
-        end;
-    end;
-    local function on_shutdown(arg93)
-        if arg93.choked_commands == 0 then
-            manual_yaw(arg93);
-        end;
-        update_body_yaw();
-        update_flick();
     end;
     local function reset_overrides()
         aa_release_hidden()
@@ -2387,12 +2898,16 @@ do
         refs.rage.main.double_tap_lag_options:override()
         refs.rage.main.hide_shots_options:override()
         tick_count,counter,switch_state,flags=0,0,false,true
+        last_body_delay=nil
+        aa_patch.body_jitter_left,aa_patch.body_jitter_right=nil,nil
         angle_refs:reset()
         aa_patch.wall_cache=nil
         aa_patch.owner=nil;aa_patch.profile=nil;aa_patch.packet_cmd=nil;aa_patch.hidden_cmd=nil;aa_patch.command=nil
+        aa_patch.defensive_switch_phase=false;aa_patch.defensive_switch_cmd=nil;aa_patch.defensive_switch_profile=nil
+        aa_patch.body_jitter_left,aa_patch.body_jitter_right=nil,nil
     end
     local local_key,last_tick=nil,nil
-    local function on_createmove(cmd)
+    local function update_anti_aim(cmd)
         local player=entity.get_local_player()
         if not player or not player:is_alive() then reset_overrides();local_key=nil;return end
         local key=tostring(player:get_index())..":"..tostring(player.m_flSpawnTime)
@@ -2405,22 +2920,111 @@ do
         angles_state:unset()
         refs.rage.main.double_tap_lag_options:override()
         refs.rage.main.hide_shots_options:override()
-        local owner=offsets(cmd)
+        local owner=resolve_anti_aim_mode(cmd)
         local scope=tostring(team_info.get())..":"..tostring(state_context.get())..":"..tostring(owner)
-            ..":"..tostring(angles_state.body_yaw)..":"..tostring(angles_state.delay_1)..":"..tostring(angles_state.delay_2)
+            ..":"..tostring(angles_state.yaw_modifier)..":"..tostring(angles_state.modifier_offset_base or angles_state.modifier_offset)
+            ..":"..tostring(angles_state.body_yaw)..":"..tostring(angles_state.left_limit_base or angles_state.left_limit)..":"..tostring(angles_state.right_limit_base or angles_state.right_limit)
+            ..":"..tostring(angles_state.delay_1)..":"..tostring(angles_state.delay_2)
+            ..":"..tostring(angles_state.yaw_offset_base)..":"..tostring(angles_state.yaw_add)
+            ..":"..tostring(angles_state.yaw_left)..":"..tostring(angles_state.yaw_right)
+
         if aa_patch.owner~=scope then
             tick_count,counter,switch_state,flags=0,0,false,true
+            last_body_delay=nil
+            aa_patch.body_jitter_left,aa_patch.body_jitter_right=nil,nil
             aa_patch.packet_cmd=nil
             aa_patch.owner=scope
         end
-        on_shutdown(cmd)
+        apply_manual_yaw(cmd)
+        if owner == "builder" then
+            local body_mode = angles_state.body_yaw
+            if body_mode == "Jitter" or body_mode == "Randomize Jitter" then
+                angles_state.inverter = switch_state
+            end
+            if angles_state.yaw_add then
+                local side_offset = 0
+                if body_mode == "Left" then
+                    side_offset = tonumber(angles_state.yaw_left) or 0
+                elseif body_mode == "Right" then
+                    side_offset = tonumber(angles_state.yaw_right) or 0
+                elseif body_mode == "Jitter" or body_mode == "Randomize Jitter" then
+                    side_offset = switch_state and (tonumber(angles_state.yaw_left) or 0)
+                        or (tonumber(angles_state.yaw_right) or 0)
+                end
+                local base_offset = tonumber(angles_state.yaw_offset_base) or 0
+                if not finite_number(base_offset) then base_offset = 0 end
+                if not finite_number(side_offset) then side_offset = 0 end
+                angles_state.yaw_offset = math.normalize_yaw(base_offset + side_offset)
+            end
+            if body_mode == "Randomize Jitter" then
+                local left_base = tonumber(angles_state.left_limit_base) or tonumber(angles_state.left_limit) or 0
+                local right_base = tonumber(angles_state.right_limit_base) or tonumber(angles_state.right_limit) or 0
+                angles_state.left_limit = math.clamp(tonumber(aa_patch.body_jitter_left) or left_base, 0, left_base)
+                angles_state.right_limit = math.clamp(tonumber(aa_patch.body_jitter_right) or right_base, 0, right_base)
+            elseif body_mode == "Jitter" then
+                angles_state.left_limit = math.clamp(tonumber(angles_state.left_limit_base) or angles_state.left_limit or 0, 0, 60)
+                angles_state.right_limit = math.clamp(tonumber(angles_state.right_limit_base) or angles_state.right_limit or 0, 0, 60)
+            else
+                aa_patch.body_jitter_left, aa_patch.body_jitter_right = nil, nil
+            end
+        end
         if not angles_state.hidden then aa_release_hidden() end
         angles_state:set()
-        if aa_patch.lc then aa_patch.lc(cmd,owner,state_context.get(),angles_state.hidden) end
     end
-    events.level_init(function()reset_overrides();local_key=nil;last_tick=nil end)
+    local anti_aim_error = nil
+    local function guarded_update_anti_aim(cmd)
+        local ok, err = pcall(update_anti_aim, cmd)
+        if not ok then
+            local message = tostring(err)
+            if anti_aim_error ~= message then
+                anti_aim_error = message
+                print_raw("[social] Anti-Aim update failed: " .. message)
+            end
+            aa_release_hidden()
+        else
+            anti_aim_error = nil
+        end
+    end
+    events.level_init(function()reset_overrides();local_key=nil;last_tick=nil;anti_aim_error=nil end)
     events.shutdown(reset_overrides);
-    events.createmove(on_createmove);
+    events.createmove(guarded_update_anti_aim);
+end;
+
+do
+    local lag_ref = refs.rage.main.double_tap_lag_options
+    local function update_lag_disablers()
+        if not globals.is_connected or not globals.is_in_game then return end
+        local me = entity.get_local_player()
+        if not me or not me:is_alive() then return end
+
+        local weapon = me:get_player_weapon()
+        local class = ""
+        if weapon then
+            pcall(function() class = tostring(weapon:get_classname() or "") end)
+        end
+
+        local dt_enabled = false
+        pcall(function() dt_enabled = refs.rage.main.double_tap:get() == true end)
+        local charge = tonumber(rage.exploit:get())
+        local active = player_state.is_onground and not player_state.is_moving
+
+        if dt_enabled then
+            if class == "CKnife" or class == "CKnifeGG" or class == "CWeaponRevolver" then
+                active = true
+            end
+            if charge and charge < 0.99 then
+                active = true
+            end
+        end
+
+        if active then
+            pcall(function() lag_ref:override("Always On") end)
+        end
+    end
+
+    events.createmove(update_lag_disablers)
+    events.level_init(function() pcall(function() lag_ref:override() end) end)
+    events.shutdown(function() pcall(function() lag_ref:override() end) end)
 end;
 
 do
@@ -2520,58 +3124,6 @@ do
     end);
 end;
 
-do
-    local lag_disablers = ui_controls.other.aimbot.lag_disablers;
-    local fake_lag = refs.antiaim.fake_lag.enabled;
-    local double_tap = refs.rage.main.double_tap;
-
-    local function double_tap_active()
-        if not double_tap then return false end
-        if double_tap:get() then return true end
-        local ok, override = pcall(function() return double_tap:get_override() end);
-        return ok and override == true;
-    end
-
-    local function on_createmove()
-        if fake_lag then fake_lag:override() end
-        if not lag_disablers.enabled:get() then return end
-
-        local player = entity.get_local_player();
-        if not player or not player:is_alive() then return end
-        local anim_state = player:get_anim_state();
-        local weapon = player:get_player_weapon();
-        if not anim_state or not weapon then return end
-
-        local disable = false;
-        if lag_disablers.states:get("Stand") then
-            local velocity = anim_state.velocity;
-            local speed = velocity and velocity:length() or 0;
-            disable = speed < 2 and anim_state.on_ground and (anim_state.anim_duck_amount or 0) < 0.8;
-        end
-        if not disable and lag_disablers.states:get("DT Knife") then
-            local classname = weapon:get_classname();
-            disable = double_tap_active() and (classname == "CKnife" or classname == "CKnifeGG");
-        end
-        if not disable and lag_disablers.states:get("DT Revolver") then
-            disable = double_tap_active() and weapon:get_name() == "R8 Revolver";
-        end
-        if not disable and lag_disablers.states:get("DT Discharge") then
-            disable = rage.exploit:get() < 1 and double_tap_active();
-        end
-        if disable and fake_lag then
-            fake_lag:override(false);
-        end
-    end
-
-    lag_disablers.enabled:set_callback(function(control)
-        if fake_lag then fake_lag:override() end
-        events.createmove(on_createmove, control:get());
-    end, true);
-    events.shutdown(function()
-        if fake_lag then fake_lag:override() end
-    end);
-end;
-
 if config.build ~= "Live" then
 
     local flags = ui_controls.other.aimbot.dormant_aimbot;
@@ -2652,7 +3204,7 @@ if config.build ~= "Live" then
             end;
             return players;
         end;
-        local function on_createmove_hitbox(arg101)
+        local function update_dormant_hitboxes(arg101)
             local local_player2 = entity.get_local_player();
             if local_player2 == nil then
                 return;
@@ -2746,7 +3298,7 @@ if config.build ~= "Live" then
         end;
         local function on_toggle13(arg103)
             local value104 = arg103:get();
-            events.createmove(on_createmove_hitbox, value104);
+            events.createmove(update_dormant_hitboxes, value104);
         end;
         flags.enabled:set_callback(on_toggle13, true);
     end;
@@ -3076,7 +3628,7 @@ if config.build == "Alpha" then
                 return flags.weapons:get(weapon_index);
             end;
         end;
-        local function on_createmove2(arg161)
+        local function update_dormant_aimbot(arg161)
             update_conditions();
             local local_player3 = entity.get_local_player();
             if local_player3 == nil or not local_player3:is_alive() then
@@ -3102,10 +3654,10 @@ if config.build == "Alpha" then
             counter.retreat = 1;
             update_conditions();
         end;
-        local function on_shutdown2()
+        local function reset_dormant_aimbot()
             update_conditions();
         end;
-        local function on_toggle14(arg162)
+        local function set_dormant_aimbot_enabled(arg162)
             local value151 = arg162:get();
             if not value151 then
                 counter.point = nil;
@@ -3113,11 +3665,11 @@ if config.build == "Alpha" then
                 counter.retreat_point = nil;
                 update_conditions();
             end;
-            events.shutdown(on_shutdown2, value151);
+            events.shutdown(reset_dormant_aimbot, value151);
             events.aim_fire(on_aim_fire, value151);
-            events.createmove(on_createmove2, value151);
+            events.createmove(update_dormant_aimbot, value151);
         end;
-        flags.enabled:set_callback(on_toggle14, true);
+        flags.enabled:set_callback(set_dormant_aimbot_enabled, true);
     end;
 end;
 
@@ -3565,6 +4117,7 @@ do
         end;
     end;
     local function damage2(arg176)
+        shot_diag_record(arg176)
         if arg176.state == nil then
             update_hit(arg176);
         else
@@ -3598,18 +4151,19 @@ do
     end;
 
     events.player_hurt(on_player_hurt, true)
+    if events.aim_fire then events.aim_fire(shot_diag_capture_fire, true) end
     events.aim_ack(damage2, true)
+    local function reset_shot_diagnostics_pending()
+        shot_diag_pending = {}
+    end
+    events.level_init(reset_shot_diagnostics_pending)
+    events.shutdown(reset_shot_diagnostics_pending)
 end;
 
 do
     local counter = ui_controls.other.aimbot.maxusrcmdprocessticks;
     local process_ticks_cvar = cvar.sv_maxusrcmdprocessticks;
-    local state = {
-        original = nil,
-        applied = nil,
-        temporary = false,
-        temporary_until = 0
-    };
+    local state = { original = nil, applied = nil };
     local warned = nil;
 
     local function warn_once(message)
@@ -3643,99 +4197,41 @@ do
         return true;
     end
 
-    local function ensure_original()
-        if state.original ~= nil then return true end
-        local value = read_ticks();
-        if value == nil then
-            warn_once("sv_maxusrcmdprocessticks is unavailable.");
-            return false;
-        end
-        state.original = value;
-        return true;
-    end
-
-    local function configured_value()
-        if counter.enabled and counter.enabled:get() then
-            local value = tonumber(counter.ticks:get());
-            if finite_number(value) then
-                return math.max(8, math.min(32, math.floor(value + 0.5)));
-            end
-        end
-        return state.original;
-    end
-
     local function sync()
         if process_ticks_cvar == nil then return false end
-        local tick = tonumber(globals.tickcount);
-        if state.temporary and finite_number(tick) and tick >= state.temporary_until then
-            state.temporary = false;
-        end
-
-        if state.temporary then
-            if read_ticks() == 19 then
-                state.applied = 19;
-                return true;
+        if not (counter.enabled and counter.enabled:get()) then
+            if state.original ~= nil and read_ticks() ~= state.original then
+                if write_ticks(state.original) then
+                    state.original = nil;
+                    state.applied = nil;
+                end
             end
-            return write_ticks(19);
-        end
-        if counter.enabled and counter.enabled:get() then
-            if not ensure_original() then return false end
-        elseif state.original == nil then
             return true;
         end
-
-        local target = configured_value();
-        if target == nil then return true end
-        if read_ticks() == target then
-            state.applied = target;
-            return true;
+        if state.original == nil then
+            state.original = read_ticks();
+            if state.original == nil then
+                warn_once("sv_maxusrcmdprocessticks is unavailable.");
+                return false;
+            end
         end
-        return write_ticks(target);
-    end
-
-    local function begin_override()
-        if process_ticks_cvar == nil or not ensure_original() then return false end
-        state.temporary = true;
-        local tick = tonumber(globals.tickcount);
-        state.temporary_until = (finite_number(tick) and tick or 0) + 3;
-        if write_ticks(19) then return true end
-        state.temporary = false;
-        return false;
-    end
-
-    local function end_override(force)
-        if not state.temporary then return true end
-        local tick = tonumber(globals.tickcount);
-        if not force and finite_number(tick) and tick < state.temporary_until then
-            return false;
-        end
-        state.temporary = false;
-        return sync();
+        local value = tonumber(counter.ticks:get());
+        if not finite_number(value) then return false end
+        value = math.max(8, math.min(32, math.floor(value + 0.5)));
+        if read_ticks() == value then state.applied = value; return true end
+        return write_ticks(value);
     end
 
     local function reset()
-        state.temporary = false;
         if state.original == nil then return true end
         local ok = write_ticks(state.original);
-        if ok then
-            state.original = nil;
-            state.applied = nil;
-        end
+        if ok then state.original = nil; state.applied = nil end
         return ok;
     end
 
-    source_controls.process_ticks = {
-        sync = sync,
-        begin_override = begin_override,
-        end_override = end_override,
-        reset = reset
-    };
-
-    local function on_setting_change()
-        sync();
-    end
-    counter.enabled:set_callback(on_setting_change, true);
-    counter.ticks:set_callback(on_setting_change);
+    source_controls.process_ticks = { sync = sync, reset = reset };
+    counter.enabled:set_callback(sync, true);
+    counter.ticks:set_callback(sync);
     events.shutdown(reset);
 end;
 
@@ -4522,18 +5018,2056 @@ do
 end
 
 do
+    local enabled = source_controls.resolver_assist
+    local predictions = {}
+    local status = "waiting for enemy samples"
+    local last_observe_time = nil
+    local prediction_enabled
+
+    local function finite(n)
+        return type(n) == "number" and n == n and math.abs(n) < math.huge
+    end
+    local function vec_ok(v)
+        return v and finite(tonumber(v.x)) and finite(tonumber(v.y)) and finite(tonumber(v.z))
+    end
+    local function vec_copy(v)
+        return vector(tonumber(v.x), tonumber(v.y), tonumber(v.z))
+    end
+    local function vec_dist(a,b)
+        local x,y,z=a.x-b.x,a.y-b.y,a.z-b.z
+        return math.sqrt(x*x+y*y+z*z)
+    end
+    local function valid_enemy(ent)
+        local ok, valid = pcall(function()
+            return ent and ent:is_valid() and ent:is_alive() and ent:is_enemy() and not ent:is_dormant()
+        end)
+        return ok and valid == true
+    end
+    local function identity(ent)
+        local ok, index, spawn = pcall(function()
+            return ent:get_index(), tonumber(ent.m_flSpawnTime) or 0
+        end)
+        if not ok or not finite(index) then return nil end
+        return tostring(index) .. ":" .. tostring(spawn), index
+    end
+    local function snapshot(ent)
+        local ok, d = pcall(function()
+            local origin = ent:get_origin()
+            local velocity = ent.m_vecVelocity
+            local sim = tonumber(ent.m_flSimulationTime)
+            local flags = tonumber(ent.m_fFlags)
+            if not vec_ok(origin) or not vec_ok(velocity) or not finite(flags) then return nil end
+            if not finite(sim) then sim = tonumber(globals.curtime) end
+            if not finite(sim) then return nil end
+            local speed = math.sqrt(velocity.x*velocity.x+velocity.y*velocity.y+velocity.z*velocity.z)
+            if not finite(speed) then return nil end
+            local sample_time = tonumber(globals.realtime)
+            if not finite(sample_time) then return nil end
+            return {
+                origin=vec_copy(origin), velocity=vec_copy(velocity), sim=sim,
+                flags=flags, time=sample_time, speed=speed
+            }
+        end)
+        if not ok then return nil end
+        return d
+    end
+    local function observe_enemies()
+        local observe_time = tonumber(globals.realtime)
+        if not finite(observe_time) then
+            status = "waiting for valid realtime"
+            predictions = {}
+            last_observe_time = nil
+            return
+        end
+        if last_observe_time and observe_time < last_observe_time then
+            predictions = {}
+            status = "resynchronizing enemy samples"
+        end
+        last_observe_time = observe_time
+        if not prediction_enabled() then
+            predictions = {}
+            status = "resolver assist disabled"
+            return
+        end
+        if not globals.is_connected or not globals.is_in_game then
+            predictions={}
+            status = "waiting for game"
+            return
+        end
+        local seen={}
+        local ok=pcall(function()
+            entity.get_players(true,false,function(ent)
+                if not valid_enemy(ent) then return end
+                local key=snapshot(ent)
+                local id=identity(ent)
+                if not key or not id then return end
+                local old=predictions[id]
+                local good=0
+                local previous,older=nil,nil
+                local current=key
+                if old and old.uid==id and old.current then
+                    local prior=old.current
+                    local dt=key.sim-prior.sim
+                    local distance=vec_dist(key.origin,prior.origin)
+                    local dvx=key.velocity.x-prior.velocity.x
+                    local dvy=key.velocity.y-prior.velocity.y
+                    local dvz=key.velocity.z-prior.velocity.z
+                    local velocity_delta=math.sqrt(dvx*dvx+dvy*dvy+dvz*dvz)
+                    if dt>0.001 and dt<=0.20 then
+                        local plausible = distance <= math.max(36, math.min(80, prior.speed*dt+32))
+                            and velocity_delta <= math.max(180, 1100*dt)
+                        if plausible then
+                            previous=prior
+                            older=old.previous
+                            good=math.min(10,(old.good or 0)+1)
+                        else
+
+                            good=0
+                        end
+                    elseif math.abs(dt)<=0.001 and distance<=2.0 and velocity_delta<=80 then
+
+                        current=prior
+                        previous=old.previous
+                        older=old.older
+                        good=old.good or 0
+                    else
+                        good=0
+                    end
+                end
+                predictions[id]={uid=id,current=current,previous=previous,older=older,good=good,seen=key.time}
+                seen[id]=true
+            end)
+        end)
+        if not ok then
+            predictions = {}
+            status="enemy enumeration unavailable; resampling"
+            return
+        end
+        local now=tonumber(globals.realtime) or 0
+        for id,entry in pairs(predictions) do
+            if not seen[id] and now-(entry.seen or 0)>0.35 then predictions[id]=nil end
+        end
+    end
+    prediction_enabled = function()
+        return enabled:get() or (source_controls.force_shot and source_controls.force_shot:get())
+    end
+    local function predict(ent)
+        if not prediction_enabled() or not valid_enemy(ent) then return nil end
+        local id=identity(ent)
+        local entry=id and predictions[id]
+        if not entry or not entry.current or entry.good<1 or not entry.previous then
+            status="collecting stable enemy samples"
+            return nil
+        end
+        entry.prediction=nil
+        local live=snapshot(ent)
+        if not live or identity(ent) ~= id then status="invalid or changed enemy snapshot";return nil end
+        local sample_age=(tonumber(globals.realtime) or 0)-(entry.seen or 0)
+        if sample_age>0.12 or sample_age<0 then status="stale enemy snapshot";return nil end
+        local curtime=tonumber(globals.curtime)
+        local simulation_age=0
+        if finite(curtime) and finite(live.sim) then
+            simulation_age=curtime-live.sim
+            if simulation_age < -0.10 or simulation_age > 0.28 then
+                status="stale simulation-time sample"
+                return nil
+            end
+            simulation_age=math.max(0,simulation_age)
+        end
+        local interval=tonumber(globals.tickinterval)
+        if not finite(interval) or interval<1/256 or interval>1/16 then status="invalid tick interval";return nil end
+
+        local incoming_latency
+        local channel_ok, channel = pcall(utils.net_channel)
+        if channel_ok and channel then
+            local function read_lane(source, index)
+                local ok, value = pcall(function() return tonumber(source[index]) end)
+                if ok and finite(value) and value >= 0 and value < 10 then return value end
+            end
+            if channel.avg_latency then incoming_latency = read_lane(channel.avg_latency, 1) end
+            if incoming_latency == nil and channel.latency then
+                incoming_latency = read_lane(channel.latency, 1)
+            end
+            local loopback = false
+            pcall(function() loopback = channel.is_loopback == true end)
+            if incoming_latency == 0 and not loopback then incoming_latency = nil end
+        end
+        if incoming_latency == nil then
+            local ping_ok, ping = pcall(function()
+                local me = entity.get_local_player()
+                local resource = entity.get_player_resource()
+                if not me or not resource then return nil end
+                return tonumber(resource.m_iPing[me:get_index()])
+            end)
+            if ping_ok and finite(ping) and ping >= 0 and ping < 5000 then
+                incoming_latency = ping / 2000
+            end
+        end
+        local interpolation_delay = 0
+        local interp_ok, interp_value = pcall(function()
+            local ref = cvar.cl_interp
+            if not ref then return nil end
+            return tonumber(ref:float())
+        end)
+        if interp_ok and finite(interp_value) then
+            interpolation_delay = math.max(0, interp_value)
+        end
+        -- Source interpolation is the greater of cl_interp and
+        -- cl_interp_ratio / cl_updaterate when both controls are available.
+        local ratio_ok, interp_ratio = pcall(function()
+            local ref = cvar.cl_interp_ratio
+            return ref and tonumber(ref:float()) or nil
+        end)
+        local rate_ok, update_rate = pcall(function()
+            local ref = cvar.cl_updaterate
+            return ref and tonumber(ref:float()) or nil
+        end)
+        if ratio_ok and rate_ok and finite(interp_ratio) and finite(update_rate)
+            and interp_ratio >= 0 and update_rate > 0 then
+            interpolation_delay = math.max(interpolation_delay, interp_ratio / update_rate)
+        end
+        interpolation_delay = math.clamp(interpolation_delay, 0, interval * 4)
+        local latency_seconds = math.max(incoming_latency or 0, simulation_age, interval)
+            + interpolation_delay
+        local tick_count=math.clamp(math.ceil(latency_seconds/interval),1,8)
+        local planar_speed=math.sqrt(live.velocity.x*live.velocity.x+live.velocity.y*live.velocity.y)
+        if planar_speed>260 then
+            tick_count=math.min(tick_count,2)
+        elseif planar_speed>190 then
+            tick_count=math.min(tick_count,3)
+        elseif planar_speed>130 then
+            tick_count=math.min(tick_count,4)
+        end
+        local confidence = entry.good or 0
+
+        local confidence_cap = confidence >= 8 and 7 or (confidence >= 5 and 5 or 3)
+        if sample_age>0.06 then confidence_cap=math.min(confidence_cap,3) end
+        if sample_age>0.09 then confidence_cap=math.min(confidence_cap,2) end
+        tick_count=math.min(tick_count,confidence_cap)
+        local previous = entry.previous
+        local measured_acceleration = 0
+        local measured_sample_dt = 0
+        if previous and live.sim > previous.sim then
+            local sample_dt = live.sim - previous.sim
+            if sample_dt > 0.001 and sample_dt < 0.20 then
+                measured_sample_dt = sample_dt
+                local dvx = live.velocity.x - previous.velocity.x
+                local dvy = live.velocity.y - previous.velocity.y
+                local dvz = live.velocity.z - previous.velocity.z
+                local acceleration = math.sqrt(dvx*dvx + dvy*dvy + dvz*dvz) / sample_dt
+                measured_acceleration = finite(acceleration) and acceleration or math.huge
+
+                local old_speed=math.sqrt(previous.velocity.x^2+previous.velocity.y^2)
+                local new_speed=math.sqrt(live.velocity.x^2+live.velocity.y^2)
+                if old_speed>35 and new_speed>35 then
+                    local dot=(previous.velocity.x*live.velocity.x+previous.velocity.y*live.velocity.y)/(old_speed*new_speed)
+                    if dot < -0.15 then tick_count=math.min(tick_count,1)
+                    elseif dot < 0.55 then tick_count=math.min(tick_count,2) end
+                end
+                if acceleration > 950 then tick_count = math.min(tick_count, 2)
+                elseif acceleration > 600 then tick_count = math.min(tick_count, 3) end
+            end
+        end
+        local ok,sim=pcall(function()
+            local movement=ent:simulate_movement(live.origin,live.velocity,live.flags)
+            if not movement then error("movement simulation unavailable") end
+            movement:think(tick_count)
+            return {origin=movement.origin,velocity=movement.velocity,collision=movement.did_hit_collision}
+        end)
+        if not ok or not sim or not vec_ok(sim.origin) or not vec_ok(sim.velocity) or type(sim.collision)~="boolean" then
+            status="movement simulation failed";return nil
+        end
+        local after=snapshot(ent)
+        if not after or math.abs(after.sim-live.sim)>0.0001 or vec_dist(after.origin,live.origin)>0.05 then
+            status="enemy record changed during simulation";return nil
+        end
+        local predicted=vec_copy(sim.origin)
+        local dt=interval*tick_count
+        local speed=math.sqrt(live.velocity.x^2+live.velocity.y^2+live.velocity.z^2)
+        if vec_dist(predicted,live.origin)>speed*dt+40 then status="unbounded prediction rejected";return nil end
+        local prev=entry.previous
+        local divergence=0
+        local velocity_change=0
+        if prev and live.sim>prev.sim then
+            local sample_dt=live.sim-prev.sim
+            if sample_dt>0.001 and sample_dt<0.25 then
+                local ax=math.clamp((live.velocity.x-prev.velocity.x)/sample_dt,-1000,1000)
+                local ay=math.clamp((live.velocity.y-prev.velocity.y)/sample_dt,-1000,1000)
+                local az=math.clamp((live.velocity.z-prev.velocity.z)/sample_dt,-1500,1500)
+                local older=entry.older
+                if older and prev.sim>older.sim then
+                    local older_dt=prev.sim-older.sim
+                    if older_dt>0.001 and older_dt<0.20 then
+                        local ox=(prev.velocity.x-older.velocity.x)/older_dt
+                        local oy=(prev.velocity.y-older.velocity.y)/older_dt
+                        local oz=(prev.velocity.z-older.velocity.z)/older_dt
+
+                        ax=ax*0.65+math.clamp(ox,-1000,1000)*0.35
+                        ay=ay*0.65+math.clamp(oy,-1000,1000)*0.35
+                        az=az*0.65+math.clamp(oz,-1500,1500)*0.35
+                    end
+                end
+                local accel_scale=confidence>=6 and 0.85 or 0.55
+                ax,ay,az=ax*accel_scale,ay*accel_scale,az*accel_scale
+                local ex=live.origin.x+live.velocity.x*dt+0.5*ax*dt*dt
+                local ey=live.origin.y+live.velocity.y*dt+0.5*ay*dt*dt
+                local ez=live.origin.z+live.velocity.z*dt+0.5*az*dt*dt
+                divergence=math.sqrt((predicted.x-ex)^2+(predicted.y-ey)^2+(predicted.z-ez)^2)
+                velocity_change=math.sqrt((live.velocity.x-prev.velocity.x)^2+(live.velocity.y-prev.velocity.y)^2+(live.velocity.z-prev.velocity.z)^2)
+
+                if not sim.collision and divergence <= 7 + tick_count * 1.25 then
+                    local blend = math.clamp(0.06 + (confidence / 10) * 0.12, 0.06, 0.18)
+                    predicted.x = predicted.x * (1-blend) + ex * blend
+                    predicted.y = predicted.y * (1-blend) + ey * blend
+                    predicted.z = predicted.z * (1-blend) + ez * blend
+                end
+            end
+        end
+        if sim.collision and live.speed>35 then status="prediction rejected: collision";return nil end
+        if planar_speed>300 and tick_count>2 then status="prediction rejected: horizon too long for speed";return nil end
+        if divergence>10+tick_count or measured_acceleration>1800 then
+            status = measured_acceleration > 1800
+                and "prediction rejected: acceleration spike"
+                or "prediction rejected: high divergence"
+            return nil
+        end
+        local result={origin=predicted,live_origin=live.origin,velocity=vec_copy(sim.velocity),
+            collision=sim.collision,divergence=divergence,velocity_change=velocity_change,
+            acceleration=measured_acceleration,sample_dt=measured_sample_dt,
+            samples=entry.good or 0,ticks=tick_count,time=tonumber(globals.realtime) or 0,id=id}
+        entry.prediction=result
+        status=string.format("enemy prediction %dt / div %.1f",tick_count,divergence)
+        return result
+    end
+    local function get_prediction_for_threat(threat)
+        if not prediction_enabled() or not valid_enemy(threat) then return nil end
+        local id=identity(threat)
+        local entry=id and predictions[id]
+        if not entry or not entry.prediction then return nil end
+        local p=entry.prediction
+        local age=(tonumber(globals.realtime) or 0)-(tonumber(p.time) or -math.huge)
+        if p.id~=id or age<0 or age>0.11 or p.collision
+            or not vec_ok(p.origin) or not vec_ok(p.live_origin) or not vec_ok(p.velocity)
+            or not finite(tonumber(p.divergence)) or not finite(tonumber(p.velocity_change))
+            or not finite(tonumber(p.acceleration))
+            or p.divergence>18 or p.acceleration>1800 or (p.samples or 0)<1 then return nil end
+        return p
+    end
+    events.net_update_end(observe_enemies)
+    events.createmove(function()
+        if not globals.is_connected or not globals.is_in_game then status="waiting for game";return end
+        local threat=entity.get_threat()
+        if not valid_enemy(threat) then status="waiting for threat";return end
+        predict(threat)
+    end)
+    events.level_init(function()
+        predictions = {}
+        last_observe_time = tonumber(globals.realtime)
+        status = "waiting for enemy samples"
+    end)
+    events.shutdown(function()
+        predictions = {}
+        last_observe_time = nil
+        status = "stopped"
+    end)
+    source_controls.extrap_status=function() return status end
+
+    social_enemy_prediction = get_prediction_for_threat
+end
+
+do
+    local enabled = source_controls.resolver_assist
+    local memory = {}
+    local active_key = nil
+    local max_targets = 64
+
+    local animlayer_type = ffi.typeof("struct { bool client_blend; float blend_in; void *studio_hdr; int dispatch_sequence; int second_dispatch_sequence; unsigned int order; unsigned int sequence; float prev_cycle; float weight; float weight_delta_rate; float playback_rate; float cycle; void *entity; char pad_0x0038[0x4]; } **")
+
+    local feet_cycle_signatures = {
+        [47012329101563] = { 58, 1 },
+        [25012207031250] = { 35, 1 },
+        [59011840820313] = { 20, 1 },
+        [43014526367188] = { 58, -1 },
+        [59014892578125] = { 30, -1 }
+    }
+
+    local function finite(v)
+        return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+    end
+
+    local function clamp(v, lo, hi)
+        if v < lo then return lo end
+        if v > hi then return hi end
+        return v
+    end
+
+    local function norm_yaw(v)
+        if not finite(v) then return nil end
+        v = (v + 180) % 360
+        if v < 0 then v = v + 360 end
+        return v - 180
+    end
+
+    local function yaw_delta(a, b)
+        return norm_yaw(a - b) or 0
+    end
+
+    local function clock_tick()
+        return tonumber(globals and globals.tickcount) or 0
+    end
+
+    local function enabled_now()
+        local ok, value = pcall(function() return enabled and enabled:get() end)
+        return ok and value == true
+    end
+
+    local function target_key(ent)
+        if not ent then return nil end
+        local ok, index, spawn = pcall(function()
+            return ent:get_index(), tonumber(ent.m_flSpawnTime) or 0
+        end)
+        if not ok or not finite(index) or index < 1 then return nil end
+        return tostring(index) .. ":" .. tostring(spawn)
+    end
+
+    local function valid_enemy(ent)
+        local ok, valid, alive, enemy, dormant = pcall(function()
+            return ent and ent:is_valid(), ent and ent:is_alive(),
+                ent and ent:is_enemy(), ent and ent:is_dormant()
+        end)
+        return ok and valid == true and alive == true and enemy == true and dormant == false
+    end
+
+    local function read_eye_yaw(ent)
+        local ok, ang = pcall(function() return ent:get_eye_angles() end)
+        if ok and ang then
+            local good, y = pcall(function() return tonumber(ang.y) end)
+            if good and finite(y) then return norm_yaw(y) end
+        end
+        local ok2, ang2 = pcall(function() return ent.m_angEyeAngles end)
+        if ok2 and ang2 then
+            local good, y = pcall(function() return tonumber(ang2.y) end)
+            if good and finite(y) then return norm_yaw(y) end
+        end
+        return nil
+    end
+
+    local function read_lby(ent)
+        local ok, value = pcall(function() return tonumber(ent.m_flLowerBodyYawTarget) end)
+        if ok and finite(value) then return norm_yaw(value) end
+        return nil
+    end
+
+    local function read_pose(ent)
+        local ok, value = pcall(function()
+            local v = entity.get_prop(ent, "m_flPoseParameter", 11)
+            if finite(tonumber(v)) then return tonumber(v) end
+            local values = ent.m_flPoseParameter
+            if type(values) == "table" then
+                if finite(tonumber(values[11])) then return tonumber(values[11]) end
+                if finite(tonumber(values[12])) then return tonumber(values[12]) end
+            end
+            return nil
+        end)
+        if not ok or not finite(value) then return nil end
+        if value >= 0 and value <= 1.2 then
+            return clamp((value - 0.5) * 120, -60, 60)
+        end
+        if value >= -1.2 and value <= 1.2 then
+            return clamp(value * 60, -60, 60)
+        end
+        return clamp(value, -60, 60)
+    end
+
+    local function read_motion(ent, lby_target)
+        local speed, velocity_yaw, velocity_z = 0, nil, 0
+        local ok, vel = pcall(function() return ent.m_vecVelocity end)
+        if ok and vel then
+            local good, vx, vy, vz = pcall(function()
+                return tonumber(vel.x), tonumber(vel.y), tonumber(vel.z)
+            end)
+            if good and finite(vx) and finite(vy) then
+                speed = math.sqrt(vx * vx + vy * vy)
+                if speed > 0.01 then velocity_yaw = norm_yaw(math.deg(math.atan2(vy, vx))) end
+                if finite(vz) then velocity_z = vz end
+            end
+        end
+        local duck = 0
+        local ok2, value = pcall(function() return tonumber(ent.m_flDuckAmount) end)
+        if ok2 and finite(value) then duck = clamp(value, 0, 1) end
+
+        local roll_pose
+        pcall(function() roll_pose = tonumber(entity.get_prop(ent, "m_flPoseParameter", 12)) end)
+        if not finite(roll_pose) then
+            pcall(function()
+                local poses = ent.m_flPoseParameter
+                if poses then roll_pose = tonumber(poses[12]) end
+            end)
+        end
+        if finite(roll_pose) then
+            if roll_pose >= 0 and roll_pose <= 1.2 then
+                roll_pose = clamp((roll_pose - 0.5) * 120, -60, 60)
+            elseif roll_pose >= -1.2 and roll_pose <= 1.2 then
+                roll_pose = clamp(roll_pose * 60, -60, 60)
+            else
+                roll_pose = clamp(roll_pose, -60, 60)
+            end
+        else
+            roll_pose = nil
+        end
+
+        local simtime
+        pcall(function() simtime = tonumber(ent.m_flSimulationTime) end)
+        if not finite(simtime) then
+            pcall(function() simtime = tonumber(entity.get_prop(ent, "m_flSimulationTime")) end)
+        end
+        if not finite(simtime) then simtime = nil end
+        local flags
+        pcall(function() flags = tonumber(ent.m_fFlags) end)
+        if not finite(flags) then
+            pcall(function() flags = tonumber(entity.get_prop(ent, "m_fFlags")) end)
+        end
+        local airborne = finite(flags) and math.floor(flags) % 2 == 0 or false
+        local state, delta
+        if airborne then
+            state, delta = "air", 44
+        elseif duck > 0.55 and speed < 110 then
+            state, delta = "duck", 54
+        elseif speed < 3 then
+            state, delta = "stand", 58
+        elseif speed < 85 then
+            state, delta = "slow", 50
+        else
+            state, delta = "move", 36
+        end
+        delta = delta * (1 - 0.20 * clamp(speed / 260, 0, 1))
+
+        local anim_ok, anim = pcall(function() return ent:get_anim_state() end)
+        local layer6_weight, layer6_playback, layer6_cycle
+        local layer3_cycle, layer3_weight, layer7_weight, layer7_cycle, layer12_weight
+        local layer_eye_mode, layer_high_delta, layer_low_delta = false, false, false
+        local server_yaw_hint, anim_move_yaw, anim_feet_cycle
+        pcall(function()
+            local ptr = ent[0]
+            if ptr == nil or ptr == ffi.NULL then return end
+            local base = ffi.cast("uintptr_t", ptr)
+            if base == 0 then return end
+            local layers = ffi.cast(animlayer_type, base + 0x2990)[0]
+            if layers == nil or layers == ffi.NULL then return end
+            layer3_cycle = tonumber(layers[3].cycle)
+            layer3_weight = tonumber(layers[3].weight)
+            layer6_weight = tonumber(layers[6].weight)
+            layer6_playback = tonumber(layers[6].playback_rate)
+            layer6_cycle = tonumber(layers[6].cycle)
+            layer7_weight = tonumber(layers[7].weight)
+            layer7_cycle = tonumber(layers[7].cycle)
+            layer12_weight = tonumber(layers[12].weight)
+        end)
+
+        if finite(layer3_cycle) and finite(layer3_weight) then
+            layer_eye_mode = (layer3_cycle >= -0.0005 and layer3_cycle <= 0.0200)
+                or layer3_cycle >= 0.9980
+                or (layer3_cycle >= 0.5548 and layer3_cycle <= 0.5558)
+            local l6_spike = finite(layer6_weight) and layer6_weight > 0.003
+                and layer6_weight < 0.008 and finite(layer6_playback)
+                and layer6_playback > 0
+            if layer_eye_mode then
+                if l6_spike then
+                    layer_high_delta = true
+                elseif layer3_weight >= 0.999 and layer3_cycle >= 0
+                    and layer3_cycle <= 0.70 then
+                    layer_low_delta = true
+                end
+            elseif layer3_weight >= 0.042 and layer3_weight <= 0.044
+                and layer3_cycle >= 0.005 and layer3_cycle <= 0.020 then
+                layer_low_delta = true
+            end
+        end
+        if layer_high_delta then
+            delta = clamp(math.max(delta, 54), 20, 62)
+        elseif layer_low_delta then
+            delta = clamp(math.min(delta, 40), 20, 62)
+        end
+        if anim_ok and anim then
+            local max_yaw, min_yaw
+            local walk_run, speed_walk, speed_duck, anim_duck
+            local anim_abs_yaw, anim_eye_yaw, aim_yaw_max, aim_yaw_min
+            pcall(function()
+                max_yaw = math.abs(tonumber(anim.max_yaw))
+                min_yaw = math.abs(tonumber(anim.min_yaw))
+                walk_run = tonumber(anim.walk_run_transition)
+                speed_walk = tonumber(anim.speed_as_portion_of_walk_top_speed)
+                speed_duck = tonumber(anim.speed_as_portion_of_crouch_top_speed)
+                anim_duck = tonumber(anim.anim_duck_amount)
+                anim_move_yaw = tonumber(anim.move_yaw)
+                anim_abs_yaw = tonumber(anim.abs_yaw)
+                anim_eye_yaw = tonumber(anim.eye_yaw)
+                aim_yaw_max = tonumber(anim.aim_yaw_max)
+                aim_yaw_min = tonumber(anim.aim_yaw_min)
+                anim_feet_cycle = tonumber(anim.feet_cycle)
+            end)
+
+            if finite(anim_duck) then
+                duck = math.max(duck, clamp(anim_duck, 0, 1))
+            end
+
+            local reported_ok = finite(max_yaw) and finite(min_yaw)
+                and max_yaw >= 10 and max_yaw <= 70
+                and min_yaw >= 10 and min_yaw <= 70
+            local formula_ok = finite(walk_run) and finite(speed_walk)
+                and finite(speed_duck) and finite(anim_duck)
+                and walk_run >= -0.1 and walk_run <= 1.1
+                and speed_walk >= -0.1 and speed_walk <= 1.1
+                and speed_duck >= -0.1 and speed_duck <= 1.1
+                and anim_duck >= -0.1 and anim_duck <= 1.1
+
+            if formula_ok then
+                speed_walk = clamp(speed_walk, 0, 1)
+                speed_duck = clamp(speed_duck, 0, 1)
+                walk_run = clamp(walk_run, 0, 1)
+                anim_duck = clamp(anim_duck, 0, 1)
+
+                if finite(anim_abs_yaw) and finite(anim_eye_yaw)
+                    and finite(aim_yaw_max) and finite(aim_yaw_min)
+                    and math.abs(aim_yaw_max) <= 90 and math.abs(aim_yaw_min) <= 90 then
+                    local run_width = walk_run + (0.8 - walk_run) * 0.5
+                    local width = speed_walk + (1 - speed_walk) * run_width
+                    if anim_duck > 0 then
+                        local duck_speed = anim_duck * speed_duck
+                        width = duck_speed + (width - duck_speed) * 0.5
+                    end
+                    width = clamp(width, 0.35, 1.05)
+                    local max_bound = aim_yaw_max * width
+                    local min_bound = aim_yaw_min * width
+                    local rebuilt = clamp(anim_abs_yaw, -360, 360)
+                    local eye_gap = yaw_delta(anim_eye_yaw, rebuilt)
+                    if eye_gap > max_bound then rebuilt = anim_eye_yaw + math.abs(max_bound)
+                    elseif eye_gap < min_bound then rebuilt = anim_eye_yaw - math.abs(min_bound) end
+                    local tick_interval = tonumber(globals and globals.tickinterval) or 0
+                    if tick_interval > 0 and tick_interval < 0.1 then
+                        local moving_on_ground = not airborne and (speed > 1 or velocity_z > 100)
+                        local target_yaw = moving_on_ground and anim_eye_yaw
+                            or (finite(lby_target) and lby_target or anim_eye_yaw)
+                        local approach_speed = tick_interval * (moving_on_ground
+                            and (30 + 20 * walk_run) or 100)
+                        local remain = yaw_delta(target_yaw, rebuilt)
+                        rebuilt = rebuilt + clamp(remain, -approach_speed, approach_speed)
+                    end
+                    server_yaw_hint = norm_yaw(rebuilt)
+                end
+
+                local modifier = ((walk_run * -0.30) - 0.20) * speed_walk + 1.0
+                if anim_duck > 0 then
+                    modifier = modifier + (anim_duck * speed_duck) * (0.5 - modifier)
+                end
+
+                local viera_delta = clamp(58.0 * modifier, 20, 62)
+                if reported_ok then
+                    local reported_delta = (max_yaw + min_yaw) * 0.5
+
+                    if math.abs(reported_delta - viera_delta) <= 12 then
+                        delta = clamp(viera_delta * 0.65 + reported_delta * 0.35, 20, 62)
+                    else
+                        delta = clamp(reported_delta, 20, 62)
+                    end
+                else
+                    delta = viera_delta
+                end
+            elseif reported_ok then
+                delta = clamp((max_yaw + min_yaw) * 0.5, 20, 62)
+            end
+
+            if state == "stand" and finite(layer3_cycle) and finite(layer3_weight) then
+                if layer3_cycle > 0.001 or layer3_weight > 0.001 then
+                    delta = clamp(delta * 0.5, 20, 62)
+                end
+            end
+        end
+
+        local anim_side_hint
+        if anim_ok and anim and finite(layer6_weight)
+            and layer6_weight > 0.001 and layer6_weight < 0.999 then
+            local abs_yaw, eye_yaw
+            pcall(function()
+                abs_yaw = tonumber(anim.abs_yaw)
+                eye_yaw = tonumber(anim.eye_yaw)
+            end)
+            if finite(abs_yaw) and finite(eye_yaw) then
+                local anim_delta = yaw_delta(abs_yaw, eye_yaw)
+                if math.abs(anim_delta) > delta + 2 and math.abs(anim_delta) < 100 then
+                    anim_side_hint = anim_delta > 0 and -1 or 1
+                end
+            end
+        end
+
+        local anim_activity = 0
+        if finite(layer6_weight) and finite(layer6_playback) then
+            anim_activity = clamp(layer6_weight, 0, 1) * clamp(math.abs(layer6_playback) / 2.5, 0, 1)
+        end
+        if finite(layer7_weight) and layer7_weight > 0.02 then
+            anim_activity = math.max(anim_activity, clamp(layer7_weight, 0, 1) * 0.65)
+        end
+        if not finite(anim_move_yaw) then anim_move_yaw = nil else anim_move_yaw = norm_yaw(anim_move_yaw) end
+        local strafe_activity = finite(layer7_cycle) and finite(layer7_weight)
+            and clamp(layer7_weight, 0, 1) * clamp(layer7_cycle, 0, 1) or 0
+        local accel_activity = finite(layer12_weight) and clamp(layer12_weight, 0, 1) or 0
+        local layer_delta_mode = layer_high_delta and "high"
+            or layer_low_delta and "low" or layer_eye_mode and "eye" or nil
+        return state, delta, speed, duck, velocity_yaw, anim_side_hint,
+            anim_move_yaw, anim_activity, strafe_activity, accel_activity, simtime, roll_pose,
+            layer_delta_mode, server_yaw_hint, anim_feet_cycle
+    end
+
+    local function get_state(key)
+        local st = memory[key]
+        if not st then
+            st = { states = {}, history = {}, created = clock_tick(), updated = clock_tick() }
+            memory[key] = st
+        end
+        st.updated = clock_tick()
+        return st
+    end
+
+    local function state_record(st, movement)
+        st.states[movement] = st.states[movement] or { misses = {}, miss_count = 0, candidates = {} }
+        local rec = st.states[movement]
+        if type(rec.candidates) ~= "table" then rec.candidates = {} end
+        return rec
+    end
+
+    local function update_candidate_feedback(rec, label, hit, weight, tick)
+        if type(label) ~= "string" or label == "" then return end
+        weight = finite(weight) and clamp(weight, 0, 1.5) or 1
+        if weight <= 0 then return end
+        rec.candidates = rec.candidates or {}
+        local stat = rec.candidates[label]
+        if not stat then
+            stat = { hits = 0, misses = 0, tick = tick }
+            rec.candidates[label] = stat
+        end
+        local last_tick = tonumber(stat.tick) or tick
+        local age = math.max(0, tick - last_tick)
+        local decay = 0.5 ^ (age / 128)
+        stat.hits = (tonumber(stat.hits) or 0) * decay
+        stat.misses = (tonumber(stat.misses) or 0) * decay
+        if hit then stat.hits = stat.hits + weight else stat.misses = stat.misses + weight end
+        local total = stat.hits + stat.misses
+        if total > 12 then
+            local factor = 12 / total
+            stat.hits, stat.misses = stat.hits * factor, stat.misses * factor
+        end
+        stat.tick = tick
+        if hit then
+            stat.miss_streak = 0
+            stat.hit_streak = math.min(8, (tonumber(stat.hit_streak) or 0) + 1)
+        else
+            stat.hit_streak = 0
+            stat.miss_streak = math.min(8, (tonumber(stat.miss_streak) or 0) + 1)
+        end
+
+        local bucket = label
+        if label == "pose" or label == "pose-inverse" or label == "adaptive-roll-pose"
+            or label == "body-delta-stable" or label == "body-delta-alternating" then
+            bucket = "body"
+        elseif label == "lby" or label == "lby-cadence" or label == "lby-periodic" or label == "lby-break" or label == "micro-lby" then
+            bucket = "lby"
+        elseif label == "side" or label == "side-inverse" or label:find("miss%-phase") then
+            bucket = "side"
+        elseif label == "move-heading" or label == "move-heading-reverse" or label == "anim-move-yaw"
+            or label == "adaptive-animproxy" then
+            bucket = "velocity"
+        elseif label == "linear-yaw-predict" or label == "adaptive-history-trend" or label == "spin-predict" or label == "spin-step-predict"
+            or label == "jitter" or label == "jitter-phase" then
+            bucket = "prediction"
+        end
+        rec.buckets = rec.buckets or {}
+        local bucket_stat = rec.buckets[bucket]
+        if not bucket_stat then
+            bucket_stat = { hits = 0, misses = 0, tick = tick, miss_streak = 0 }
+            rec.buckets[bucket] = bucket_stat
+        end
+        local bucket_age = math.max(0, tick - (tonumber(bucket_stat.tick) or tick))
+        local bucket_decay = 0.5 ^ (bucket_age / 128)
+        bucket_stat.hits = (tonumber(bucket_stat.hits) or 0) * bucket_decay
+        bucket_stat.misses = (tonumber(bucket_stat.misses) or 0) * bucket_decay
+        if hit then
+            bucket_stat.hits = bucket_stat.hits + weight
+            bucket_stat.miss_streak = 0
+        else
+            bucket_stat.misses = bucket_stat.misses + weight
+            bucket_stat.miss_streak = math.min(8, (tonumber(bucket_stat.miss_streak) or 0) + 1)
+        end
+        local bucket_total = bucket_stat.hits + bucket_stat.misses
+        if bucket_total > 18 then
+            local factor = 18 / bucket_total
+            bucket_stat.hits, bucket_stat.misses = bucket_stat.hits * factor, bucket_stat.misses * factor
+        end
+        bucket_stat.tick = tick
+    end
+
+    local function sample_history(st, yaw, tick)
+        if not finite(yaw) or st.history_tick == tick then return end
+        st.history_tick = tick
+        local h = st.history
+        h[#h + 1] = yaw
+        while #h > 12 do table.remove(h, 1) end
+        if #h < 4 then st.jitter, st.alternating, st.spin = 0, false, 0; st.viera_jitter = false; return end
+        local flips, same, total, previous = 0, 0, 0, nil
+
+        local wide_flips, wide_same, wide_previous = 0, 0, nil
+        for i = 2, #h do
+            local d = yaw_delta(h[i], h[i - 1])
+            local magnitude = math.abs(d)
+            if magnitude > 7 then
+                if previous then
+                    if d * previous < 0 then flips = flips + 1 else same = same + 1 end
+                end
+                previous = d
+                total = total + magnitude
+            end
+            if magnitude >= 29 then
+                if wide_previous then
+                    if d * wide_previous < 0 then wide_flips = wide_flips + 1
+                    else wide_same = wide_same + 1 end
+                end
+                wide_previous = d
+            end
+        end
+        local turns = flips + same
+        local wide_turns = wide_flips + wide_same
+        local fine_score = (total / math.max(1, #h - 1)) / 75
+            + (turns > 0 and flips / turns * 0.55 or 0)
+        local wide_score = wide_turns > 0 and (wide_flips / wide_turns) or 0
+        st.jitter = clamp(fine_score * 0.78
+            + (wide_turns >= 2 and wide_score * 0.22 or 0), 0, 1)
+        st.alternating = (turns >= 2 and flips / turns > 0.60)
+            or (wide_turns >= 2 and wide_score > 0.60)
+        st.spin = turns >= 2 and same / turns > 0.70
+        st.viera_jitter = wide_turns >= 2 and wide_score > 0.60
+        st.last_turn = previous or wide_previous
+
+        local sx, sy, count = 0, 0, 0
+        local first = math.max(1, #h - 7)
+        for i = first, #h do
+            local r = math.rad(h[i])
+            sx, sy, count = sx + math.cos(r), sy + math.sin(r), count + 1
+        end
+        local center = count > 0 and (math.abs(sx) + math.abs(sy) > 0.001
+            and math.deg(math.atan2(sy, sx)) or h[#h]) or h[#h]
+        local amplitude, deviations = 0, {}
+        for i = first, #h do
+            local deviation = math.abs(yaw_delta(h[i], center))
+            amplitude = amplitude + deviation
+            deviations[#deviations + 1] = deviation
+        end
+        amplitude = clamp(amplitude / math.max(1, count), 0, 60)
+
+        table.sort(deviations)
+        local middle = math.floor((#deviations + 1) * 0.5)
+        local median_deviation = deviations[middle] or amplitude
+        local absolute_errors = {}
+        for i = 1, #deviations do
+            absolute_errors[i] = math.abs(deviations[i] - median_deviation)
+        end
+        table.sort(absolute_errors)
+        local mad = absolute_errors[math.floor((#absolute_errors + 1) * 0.5)] or 0
+        local robust_amplitude = clamp(median_deviation + 1.4826 * mad, 0, 60)
+        local current_deviation = math.abs(yaw_delta(yaw, center))
+        local outlier = current_deviation > math.max(24, median_deviation + 3 * math.max(mad, 1.5))
+        st.yaw_outlier_rate = clamp((st.yaw_outlier_rate or 0) * 0.78 + (outlier and 0.22 or 0), 0, 1)
+        st.history_quality = clamp(1 - st.yaw_outlier_rate * 0.70, 0.45, 1)
+        st.jitter_center = norm_yaw(center)
+        st.jitter_mad = mad
+        st.jitter_amplitude = clamp((st.jitter_amplitude or robust_amplitude) * 0.55
+            + (robust_amplitude * 0.70 + amplitude * 0.30) * 0.45, 0, 60)
+
+        local phase_first = math.max(2, #h - 7)
+        local big_steps, step_total, phase_flips, phase_same, considered, signed_total = 0, 0, 0, 0, 0, 0
+        local previous_delta
+        for i = phase_first, #h do
+            local d = yaw_delta(h[i], h[i - 1])
+            local magnitude = math.abs(d)
+            step_total, signed_total = step_total + magnitude, signed_total + d
+            if magnitude > 20 then big_steps = big_steps + 1 end
+            if magnitude > 8 then
+                considered = considered + 1
+                if previous_delta then
+                    if d * previous_delta < 0 then phase_flips = phase_flips + 1
+                    else phase_same = phase_same + 1 end
+                end
+                previous_delta = d
+            end
+        end
+        local intervals = math.max(1, #h - phase_first + 1)
+        local avg_step = step_total / intervals
+        local phase_turns = phase_flips + phase_same
+        local phase_flip_ratio = phase_turns > 0 and phase_flips / phase_turns or 0
+        local phase_same_ratio = phase_turns > 0 and phase_same / phase_turns or 0
+        st.phase_conf = phase_flip_ratio
+        st.spin_score = phase_same_ratio
+        st.spin_step = considered > 0 and signed_total / considered or 0
+        st.jitter = clamp(st.jitter * 0.82
+            + ((big_steps / intervals) * 0.35 + (avg_step / 100) * 0.25
+                + phase_flip_ratio * 0.30 + clamp(st.jitter_amplitude / 55, 0, 1) * 0.10) * 0.18, 0, 1)
+        local current_phase = yaw_delta(yaw, st.jitter_center or center)
+        if math.abs(current_phase) > 7 then st.jitter_side = current_phase >= 0 and 1 or -1 end
+        st.anemone_alternating = phase_flip_ratio > 0.60 and st.jitter_amplitude > 14
+
+        st.trend_confidence, st.trend_step = 0, nil
+        if #h >= 4 and not st.alternating and not st.viera_jitter
+            and not st.anemone_alternating and st.jitter < 0.48 then
+            local d1 = yaw_delta(h[#h - 1], h[#h - 2])
+            local d2 = yaw_delta(h[#h], h[#h - 1])
+            local trend_error = math.abs(yaw_delta(d2, d1))
+            if math.abs(d2) >= 2 and math.abs(d2) <= 30 and trend_error <= 6 then
+                st.trend_step = d2
+                st.trend_confidence = clamp(1 - trend_error / 8, 0, 1)
+                st.trend_tick = tick
+            end
+        end
+
+        if #h >= 4 and not st.alternating and not st.viera_jitter
+            and not st.anemone_alternating and st.jitter < 0.58 then
+            local first_trend = math.max(2, #h - 4)
+            local trend_sum, trend_weight, trend_samples = 0, 0, 0
+            for i = first_trend, #h do
+                local age = #h - i
+                local weight = math.max(0.35, 1 - age * 0.18)
+                trend_sum = trend_sum + yaw_delta(h[i], h[i - 1]) * weight
+                trend_weight = trend_weight + weight
+                trend_samples = trend_samples + 1
+            end
+            if trend_samples >= 2 and trend_weight > 0 then
+                local average_trend = clamp(trend_sum / trend_weight, -42, 42)
+                if math.abs(average_trend) >= 1.5 then
+                    st.adaptive_trend_yaw = norm_yaw(yaw + average_trend)
+                    st.adaptive_trend_tick = tick
+                    st.adaptive_trend_confidence = clamp(1 - math.abs(average_trend) / 60, 0.25, 0.85)
+                else
+                    st.adaptive_trend_yaw, st.adaptive_trend_confidence = nil, 0
+                end
+            end
+        else
+            st.adaptive_trend_yaw, st.adaptive_trend_confidence = nil, 0
+        end
+    end
+
+    local function update_context(st, movement, speed, base, lby, pose, tick, anim_side_hint,
+        anim_activity, strafe_activity, accel_activity, delta, simtime, duck, layer_delta_mode, feet_cycle)
+        if st.context_tick == tick then return end
+        local gap = st.context_tick and tick - st.context_tick or 1
+        st.context_tick = tick
+
+        local previous_speed = finite(st.adaptive_prev_speed) and st.adaptive_prev_speed or speed
+        local previous_pose = finite(st.adaptive_prev_pose) and st.adaptive_prev_pose or (pose or 0)
+        local speed_change = math.abs((speed or 0) - previous_speed)
+        local pose_change = math.abs((pose or 0) - previous_pose)
+        st.animation_proxy = clamp(speed_change / 90 * 0.35 + pose_change / 45 * 0.40
+            + (gap > 2 and 0.25 or 0), 0, 1)
+        st.adaptive_prev_speed, st.adaptive_prev_pose = speed or 0, pose or 0
+
+        if finite(feet_cycle) and feet_cycle >= 0 and feet_cycle <= 1.001 then
+            local cycle_key = math.floor(feet_cycle * 100000000000000)
+            if st.feet_cycle_key == cycle_key then
+                st.feet_cycle_stable = math.min(16, (st.feet_cycle_stable or 0) + 1)
+            else
+                st.feet_cycle_key = cycle_key
+                st.feet_cycle_stable = 1
+                st.feet_cycle_since = tick
+            end
+            local signature = feet_cycle_signatures[cycle_key]
+            if signature and st.feet_cycle_stable >= 5 then
+                st.feet_cycle_angle = signature[1]
+                st.feet_cycle_side = signature[2]
+                st.feet_cycle_tick = tick
+            elseif not signature then
+                st.feet_cycle_angle, st.feet_cycle_side = nil, nil
+            end
+        else
+            st.feet_cycle_stable = 0
+            st.feet_cycle_angle, st.feet_cycle_side = nil, nil
+        end
+
+        if layer_delta_mode then
+            st.layer_mode_votes = st.layer_mode_votes or { high = 0, low = 0, eye = 0 }
+            st.layer_mode_votes[layer_delta_mode] = math.min(6,
+                (st.layer_mode_votes[layer_delta_mode] or 0) + 1)
+            for name, value in pairs(st.layer_mode_votes) do
+                if name ~= layer_delta_mode then st.layer_mode_votes[name] = math.max(0, value - 1) end
+            end
+            if (st.layer_mode_votes[layer_delta_mode] or 0) >= 2 then
+                st.layer_delta_mode = layer_delta_mode
+                st.layer_mode_tick = tick
+            end
+        else
+            st.layer_mode_votes = st.layer_mode_votes or { high = 0, low = 0, eye = 0 }
+            for name, value in pairs(st.layer_mode_votes) do
+                st.layer_mode_votes[name] = math.max(0, value - 0.25)
+            end
+        end
+        if st.layer_mode_tick and tick - st.layer_mode_tick > 24 then
+            st.layer_delta_mode = nil
+        end
+
+        st.gap_history = st.gap_history or {}
+        st.gap_history[#st.gap_history + 1] = clamp(gap, 1, 32)
+        while #st.gap_history > 16 do table.remove(st.gap_history, 1) end
+        local gap_sum, gap_deviation = 0, 0
+        for i = 1, #st.gap_history do gap_sum = gap_sum + st.gap_history[i] end
+        local gap_mean = gap_sum / math.max(1, #st.gap_history)
+        for i = 1, #st.gap_history do gap_deviation = gap_deviation + math.abs(st.gap_history[i] - gap_mean) end
+        gap_deviation = gap_deviation / math.max(1, #st.gap_history)
+        st.network_quality = clamp(1 - math.max(0, gap_mean - 2) * 0.075 - gap_deviation * 0.10, 0.35, 1)
+
+        if finite(simtime) then
+            local interval = tonumber(globals and globals.tickinterval) or 0
+            if interval > 0 and interval < 0.1 then
+                if not finite(st.sim_quality) then st.sim_quality = 0.72 end
+                if finite(st.last_simtime) then
+                    local sim_delta = simtime - st.last_simtime
+                    if sim_delta < -interval * 0.05 or sim_delta > interval * 16 then
+                        st.sim_break_tick = tick
+                        st.sim_quality = clamp(st.sim_quality * 0.52, 0.12, 1)
+                        st.side_score = (st.side_score or 0) * 0.45
+                        st.lby_cadence_confidence = (st.lby_cadence_confidence or 0) * 0.55
+                        st.lby_expected_tick = nil
+                        st.choke_history = {}
+                        st.choke_average, st.choke_mad, st.choke_stability = nil, nil, nil
+                    elseif sim_delta > interval * 0.25 then
+                        local tick_ratio = sim_delta / interval
+                        local sim_ticks = math.max(1, math.floor(tick_ratio + 0.5))
+                        local cadence_error = math.abs(tick_ratio - sim_ticks)
+                        local cadence_quality = 1 - clamp(cadence_error / 0.45, 0, 1)
+                        st.sim_quality = clamp(st.sim_quality * 0.72 + cadence_quality * 0.28, 0.12, 1)
+                        local estimated_choke = clamp(sim_ticks - 1, 0, 15)
+                        st.choke_history = st.choke_history or {}
+                        st.choke_history[#st.choke_history + 1] = estimated_choke
+                        while #st.choke_history > 16 do table.remove(st.choke_history, 1) end
+                        local sum, values = 0, {}
+                        for i = 1, #st.choke_history do
+                            sum = sum + st.choke_history[i]
+                            values[i] = st.choke_history[i]
+                        end
+                        table.sort(values)
+                        local median = values[math.floor((#values + 1) * 0.5)] or estimated_choke
+                        local deviations = {}
+                        for i = 1, #values do deviations[i] = math.abs(values[i] - median) end
+                        table.sort(deviations)
+                        local mad = deviations[math.floor((#deviations + 1) * 0.5)] or 0
+                        local avg = sum / math.max(1, #st.choke_history)
+                        st.choke_average = avg
+                        st.choke_mad = mad
+                        st.choke_stability = clamp(1 - mad / 5 - math.abs(avg - median) / 8, 0, 1)
+                        local choke_penalty = clamp(math.max(0, avg - 2) * 0.045 + mad * 0.035, 0, 0.42)
+                        st.network_quality = clamp(st.network_quality * (1 - choke_penalty)
+                            * (0.78 + st.choke_stability * 0.22), 0.25, 1)
+                    end
+                end
+                st.last_simtime = simtime
+            end
+        end
+
+        if finite(duck) then
+            st.duck_history = st.duck_history or {}
+            st.duck_history[#st.duck_history + 1] = clamp(duck, 0, 1)
+            while #st.duck_history > 12 do table.remove(st.duck_history, 1) end
+            local duck_min, duck_max, duck_sum = 1, 0, 0
+            for i = 1, #st.duck_history do
+                local value = st.duck_history[i]
+                duck_min, duck_max = math.min(duck_min, value), math.max(duck_max, value)
+                duck_sum = duck_sum + value
+            end
+            local duck_mean = duck_sum / math.max(1, #st.duck_history)
+            local duck_deviation = 0
+            for i = 1, #st.duck_history do
+                duck_deviation = duck_deviation + math.abs(st.duck_history[i] - duck_mean)
+            end
+            duck_deviation = duck_deviation / math.max(1, #st.duck_history)
+            st.duck_spread = duck_max - duck_min
+            st.duck_stability = clamp(1 - duck_deviation * 2.8 - st.duck_spread * 0.35, 0.20, 1)
+
+            local duck_count = #st.duck_history
+            local duck_mixed, duck_high, duck_low, duck_flips = 0, 0, 0, 0
+            local previous_duck_delta = 0
+            for i = 1, duck_count do
+                local value = st.duck_history[i]
+                if value > 0.12 and value < 0.88 then duck_mixed = duck_mixed + 1 end
+                if value > 0.72 then duck_high = duck_high + 1 end
+                if value < 0.20 then duck_low = duck_low + 1 end
+                if i > 1 then
+                    local difference = value - st.duck_history[i - 1]
+                    if math.abs(difference) > 0.08 then
+                        if previous_duck_delta ~= 0 and difference * previous_duck_delta < 0 then
+                            duck_flips = duck_flips + 1
+                        end
+                        previous_duck_delta = difference
+                    end
+                end
+            end
+            local duck_periodic = duck_flips >= 3
+            local duck_mixed_endpoints = duck_mixed >= math.max(4, math.floor(duck_count * 0.35))
+                and duck_high >= 2 and duck_low >= 2
+            st.fake_duck = duck_count >= 8 and st.duck_spread > 0.10
+                and (duck_periodic or duck_mixed_endpoints)
+            st.fake_duck_confidence = clamp((duck_flips / 5) * 0.55
+                + (duck_mixed_endpoints and 0.30 or 0)
+                + (st.duck_spread > 0.25 and 0.15 or 0), 0, 1)
+            if finite(st.last_duck) and math.abs(duck - st.last_duck) > 0.18 then
+                st.duck_transition_tick = tick
+            end
+            st.last_duck = duck
+            st.duck_transition = st.duck_transition_tick and tick - st.duck_transition_tick <= 3 or false
+        end
+        st.stability = st.last_movement == movement and gap > 0 and gap <= 3
+            and math.min(12, (st.stability or 0) + 1) or 1
+        st.last_movement = movement
+
+        local history_quality = clamp(#(st.history or {}) / 8, 0, 1)
+        local network_quality = clamp(tonumber(st.network_quality) or 0.50, 0, 1)
+        local simulation_quality = clamp(tonumber(st.sim_quality) or 0.55, 0, 1)
+        local duck_quality = clamp(tonumber(st.duck_stability) or 0.55, 0, 1)
+        local motion_quality = clamp((tonumber(st.stability) or 1) / 8, 0, 1)
+        local freshness_quality = gap <= 2 and 1 or (gap <= 4 and 0.72 or 0.38)
+        if st.sim_break_tick and tick - st.sim_break_tick <= 3 then
+            freshness_quality = math.min(freshness_quality, 0.25)
+        end
+        st.data_quality = clamp(
+            history_quality * 0.20 +
+            network_quality * 0.17 +
+            simulation_quality * 0.19 +
+            duck_quality * 0.12 +
+            motion_quality * 0.14 +
+            freshness_quality * 0.18, 0, 1)
+
+        local quality_sum = network_quality + simulation_quality +
+            duck_quality + motion_quality + freshness_quality
+        local quality_mean = quality_sum / 5
+        local quality_deviation =
+            (math.abs(network_quality - quality_mean) +
+             math.abs(simulation_quality - quality_mean) +
+             math.abs(duck_quality - quality_mean) +
+             math.abs(motion_quality - quality_mean) +
+             math.abs(freshness_quality - quality_mean)) / 5
+        st.feature_agreement = clamp(1 - quality_deviation * 1.35, 0, 1)
+        st.evidence_confidence = clamp(
+            st.data_quality * 0.72 + st.feature_agreement * 0.28, 0, 1)
+
+        if finite(lby) then
+            if finite(st.previous_lby) then
+                local change = math.abs(yaw_delta(lby, st.previous_lby))
+                if change > 25 then
+                    st.lby_break_yaw, st.lby_break_tick = lby, tick
+                    st.lby_breaks = (st.lby_breaks or 0) + 1
+
+                    if st.last_lby_change_tick then
+                        local interval_ticks = tick - st.last_lby_change_tick
+                        if interval_ticks >= 8 and interval_ticks <= 128 then
+                            st.lby_intervals = st.lby_intervals or {}
+                            st.lby_intervals[#st.lby_intervals + 1] = interval_ticks
+                            while #st.lby_intervals > 8 do table.remove(st.lby_intervals, 1) end
+                            local sorted = {}
+                            for i = 1, #st.lby_intervals do sorted[i] = st.lby_intervals[i] end
+                            table.sort(sorted)
+                            local median_interval = sorted[math.floor((#sorted + 1) * 0.5)] or interval_ticks
+                            local deviations = {}
+                            for i = 1, #sorted do deviations[i] = math.abs(sorted[i] - median_interval) end
+                            table.sort(deviations)
+                            local interval_mad = deviations[math.floor((#deviations + 1) * 0.5)] or 0
+                            st.lby_interval = median_interval
+                            st.lby_interval_mad = interval_mad
+                            st.lby_cadence_confidence = clamp((#sorted / 5) * (1 - interval_mad / 24), 0, 1)
+                            st.lby_expected_tick = tick + median_interval
+                        end
+                    end
+                    st.last_lby_change_tick = tick
+                end
+            end
+            st.previous_lby = lby
+
+            st.lby_span_history = st.lby_span_history or {}
+            if st.lby_span_tick ~= tick then
+                st.lby_span_history[#st.lby_span_history + 1] = math.abs(yaw_delta(lby, base))
+                while #st.lby_span_history > 16 do table.remove(st.lby_span_history, 1) end
+                st.lby_span_tick = tick
+                local spans = {}
+                for i = 1, #st.lby_span_history do spans[i] = st.lby_span_history[i] end
+                table.sort(spans)
+                st.lby_span = spans[math.floor((#spans + 1) * 0.5)] or nil
+            end
+
+            local body_delta = yaw_delta(base, lby)
+            st.body_delta_history = st.body_delta_history or {}
+            local bh = st.body_delta_history
+            if st.body_delta_tick ~= tick then
+                bh[#bh + 1] = body_delta
+                while #bh > 24 do table.remove(bh, 1) end
+                st.body_delta_tick = tick
+            end
+            if #bh >= 6 then
+                local left_sum, right_sum, left_w, right_w = 0, 0, 0, 0
+                local abs_sum, abs_w, flips, transitions, previous_sign = 0, 0, 0, 0, 0
+                local abs_values = {}
+                local first_delta = math.max(1, #bh - 23)
+                for i = first_delta, #bh do
+                    local value = yaw_delta(bh[i], 0)
+                    local age = #bh - i
+                    local weight = math.max(0.30, 1.0 - age * 0.035)
+                    abs_values[#abs_values + 1] = math.abs(value)
+                    abs_sum, abs_w = abs_sum + math.abs(value) * weight, abs_w + weight
+                    local current_sign = math.abs(value) > 8 and (value > 0 and 1 or -1) or 0
+                    if current_sign ~= 0 then
+                        if previous_sign ~= 0 then
+                            transitions = transitions + 1
+                            if current_sign ~= previous_sign then flips = flips + 1 end
+                        end
+                        previous_sign = current_sign
+                        if current_sign > 0 then
+                            right_sum, right_w = right_sum + math.abs(value) * weight, right_w + weight
+                        else
+                            left_sum, left_w = left_sum + math.abs(value) * weight, left_w + weight
+                        end
+                    end
+                end
+                table.sort(abs_values)
+                local middle = math.floor((#abs_values + 1) * 0.5)
+                local median_abs = abs_values[middle] or 0
+                local mean_abs = abs_sum / math.max(abs_w, 0.001)
+                local left_mag = left_sum / math.max(left_w, 0.001)
+                local right_mag = right_sum / math.max(right_w, 0.001)
+                local side_balance = math.min(left_w, right_w) / math.max(math.max(left_w, right_w), 0.001)
+                local flip_rate = flips / math.max(transitions, 1)
+                local alternating = flip_rate >= 0.42 and side_balance >= 0.35
+                local stable_side = left_w > right_w and left_w > 1 and -1
+                    or right_w > left_w and right_w > 1 and 1
+                    or (body_delta >= 0 and 1 or -1)
+                local magnitude = clamp(median_abs * 0.65 + mean_abs * 0.35, 0, 60)
+                local stability = alternating and 0.82
+                    or (math.max(left_w, right_w) >= abs_w * 0.72 and 0.90)
+                    or (side_balance >= 0.28 and 0.62) or 0.35
+                local confidence = clamp((magnitude - 14) / 46, 0, 1)
+                    * (0.45 + stability * 0.40 + clamp((#bh - 5) / 17, 0, 1) * 0.15)
+                local correction = alternating and -(body_delta >= 0 and 1 or -1) * clamp(math.abs(body_delta), 18, 58)
+                    or -stable_side * clamp(alternating and magnitude or (stable_side < 0 and left_mag or right_mag), 18, 58)
+                local learn_rate = alternating and 0.48 or 0.34
+                if st.body_offset and math.abs(st.body_offset) > 1
+                    and (st.body_offset > 0) ~= (correction > 0) then learn_rate = math.max(learn_rate, 0.60) end
+                st.body_offset = clamp((st.body_offset or 0) * (1 - learn_rate) + correction * learn_rate, -58, 58)
+                st.body_confidence = clamp(confidence, 0, 1)
+                st.body_magnitude = magnitude
+                st.body_alternating = alternating
+                st.body_side_balance = side_balance
+            else
+                st.body_confidence, st.body_magnitude = 0, 0
+            end
+        end
+
+        if not st.profile_check_tick or tick - st.profile_check_tick >= 768 then
+            local signature = {
+                jitter = (st.jitter or 0) > 0.48,
+                alternating = st.alternating == true,
+                magnitude = tonumber(st.body_magnitude) or tonumber(delta) or 58,
+                side = st.side or 0
+            }
+            local previous = st.profile_signature
+            if previous then
+                local changed = signature.jitter ~= previous.jitter
+                    or signature.alternating ~= previous.alternating
+                    or math.abs(signature.magnitude - (previous.magnitude or signature.magnitude)) > 18
+                    or (signature.side ~= 0 and previous.side ~= 0 and signature.side ~= previous.side)
+                st.profile_drift_count = changed and ((st.profile_drift_count or 0) + 1) or 0
+                if st.profile_drift_count >= 2 then
+                    st.side_score = 0
+                    st.body_offset = nil
+                    st.body_confidence = 0
+                    st.body_magnitude = 0
+                    st.profile_drift_count = 0
+                    st.profile_reset_tick = tick
+                end
+            else
+                st.profile_drift_count = 0
+            end
+            st.profile_signature = signature
+            st.profile_check_tick = tick
+        end
+
+        if speed > 3 then
+            st.move_yaw = lby or base
+            st.move_tick = tick
+            st.stop_tick, st.stop_anchor = nil, nil
+            st.cadence_phase = "moving"
+        else
+            if st.move_tick and not st.stop_tick and tick - st.move_tick <= 4 then
+                st.stop_tick = tick
+                st.stop_anchor = st.move_yaw or lby or base
+            end
+            if st.stop_tick then
+                local age = tick - st.stop_tick
+                if age <= 14 then
+                    st.cadence_phase, st.cadence_anchor = "stop", st.stop_anchor
+                elseif age <= 70 then
+                    st.cadence_phase, st.cadence_anchor = "lby", lby or st.stop_anchor
+                else
+                    st.cadence_phase, st.cadence_anchor = "expired", nil
+                end
+            else
+                st.cadence_phase, st.cadence_anchor = "expired", nil
+            end
+        end
+
+        local pose_sign = finite(pose) and math.abs(pose) >= 7 and (pose > 0 and 1 or -1) or 0
+        if pose_sign ~= 0 and st.pose_sign and pose_sign ~= st.pose_sign then
+            st.side_switch_tick = tick
+        end
+        if pose_sign ~= 0 then st.pose_sign = pose_sign end
+        st.side_switch = st.side_switch_tick and tick - st.side_switch_tick <= 3 or false
+        local vote = 0
+        if pose_sign ~= 0 then vote = vote + pose_sign * clamp(math.abs(pose) / 30, 0.55, 1.4) end
+        if finite(lby) then
+            local d = yaw_delta(lby, base)
+            if math.abs(d) > 10 and math.abs(d) < 150 then vote = vote + (d > 0 and 1 or -1) end
+        end
+        if anim_side_hint == 1 or anim_side_hint == -1 then
+            vote = vote + anim_side_hint * (0.35 + clamp(anim_activity or 0, 0, 1) * 0.45)
+        end
+        if st.last_turn and math.abs(st.last_turn) > 7 then vote = vote + (st.last_turn > 0 and 1 or -1) * 0.35 end
+        if st.jitter_side == 1 or st.jitter_side == -1 then
+            vote = vote + st.jitter_side * 0.45
+        end
+
+        local transition = clamp((strafe_activity or 0) * 0.45 + (accel_activity or 0) * 0.30
+            + (st.duck_transition and 0.25 or 0)
+            + (st.fake_duck and (0.20 + (st.fake_duck_confidence or 0) * 0.20) or 0), 0, 0.90)
+        st.side_score = clamp((st.side_score or 0) * (0.72 - transition * 0.18) + vote * (1 - transition * 0.25), -4, 4)
+        if math.abs(st.side_score) > 0.35 then st.side = st.side_score >= 0 and 1 or -1 end
+        st.side = st.side or 1
+        st.quality = clamp(((gap > 0 and gap <= 3 and 0.48 or 0.12) +
+            clamp(math.abs(pose or 0) / 60, 0, 1) * 0.22 +
+            clamp((st.stability or 0) / 8, 0, 1) * 0.18 +
+            clamp(anim_activity or 0, 0, 1) * 0.10 +
+            clamp(st.duck_stability or 0.5, 0, 1) * 0.08) *
+            (0.72 + (st.network_quality or 0.5) * 0.28) *
+            (0.78 + (st.history_quality or 0.75) * 0.22) *
+            (0.82 + (st.sim_quality or 0.72) * 0.18) *
+            (st.fake_duck and 0.88 or 1), 0, 1)
+    end
+
+    local function add_candidate(list, label, yaw, prior)
+        yaw = norm_yaw(yaw)
+        if not finite(yaw) then return end
+        for i = 1, #list do
+            if math.abs(yaw_delta(yaw, list[i].yaw)) < 4 then
+                if prior > list[i].prior then list[i].prior, list[i].label = prior, label end
+                return
+            end
+        end
+        list[#list + 1] = { label = label, yaw = yaw, prior = prior }
+    end
+
+    local function choose_candidate(st, rec, movement, base, lby, pose, delta, tick, speed, velocity_yaw, anim_move_yaw, anim_activity, roll_pose)
+        local candidates = {}
+        local side = st.side or 1
+
+        if finite(st.lby_span) and st.lby_span > 14 and st.lby_span < delta then
+            delta = clamp(st.lby_span, 14, delta)
+        end
+        add_candidate(candidates, "eye", base, 0.22)
+
+        if finite(st.trend_step) and finite(st.trend_confidence)
+            and st.trend_confidence >= 0.45 and st.trend_tick and tick - st.trend_tick <= 2
+            and not st.alternating and (st.jitter or 0) < 0.48 then
+            add_candidate(candidates, "linear-yaw-predict", base + st.trend_step,
+                0.27 + clamp(st.trend_confidence, 0, 1) * 0.16)
+        end
+
+        if finite(st.feet_cycle_angle) and (st.feet_cycle_tick or 0) >= tick - 2
+            and (st.feet_cycle_side == 1 or st.feet_cycle_side == -1) then
+            add_candidate(candidates, "feet-cycle-signature",
+                base + st.feet_cycle_side * clamp(st.feet_cycle_angle, 18, 58), 0.32)
+        end
+        if finite(st.server_yaw_hint) and tick - (st.server_yaw_tick or tick) <= 2 then
+            local server_gap = math.abs(yaw_delta(st.server_yaw_hint, base))
+            if server_gap >= 5 and server_gap <= math.min(100, delta + 25) then
+                add_candidate(candidates, "server-yaw-rebuild", st.server_yaw_hint,
+                    0.29 + clamp(st.quality or 0.5, 0, 1) * 0.10)
+            end
+        end
+
+        if finite(anim_move_yaw) and (movement == "move" or movement == "slow" or movement == "duck")
+            and finite(anim_activity) and anim_activity > 0.18 then
+            local anim_gap = math.abs(yaw_delta(anim_move_yaw, base))
+            if anim_gap >= 10 and anim_gap <= 110 then
+                add_candidate(candidates, "anim-move-yaw", anim_move_yaw,
+                    0.22 + clamp(anim_activity, 0, 1) * 0.12)
+            end
+        end
+        if (movement == "move" or movement == "slow") and finite(speed) and speed > 105
+            and finite(velocity_yaw) then
+            local heading_gap = math.abs(yaw_delta(velocity_yaw, base))
+            if heading_gap >= 14 and heading_gap <= 105 then
+                local heading_prior = 0.25 + clamp((speed - 105) / 300, 0, 0.08)
+                add_candidate(candidates, "move-heading", velocity_yaw, heading_prior)
+                if heading_gap > 55 then
+                    add_candidate(candidates, "move-heading-reverse", velocity_yaw + 180, 0.18)
+                end
+            end
+        end
+        if finite(lby) then
+            local d = math.abs(yaw_delta(lby, base))
+            if d <= (movement == "air" and 90 or 62) then add_candidate(candidates, "lby", lby, 0.52 + clamp(d / 100, 0, 0.2)) end
+        end
+        if finite(pose) and math.abs(pose) >= 5 then
+            add_candidate(candidates, "pose", base + pose, 0.48 + clamp(math.abs(pose) / 120, 0, 0.22))
+            add_candidate(candidates, "pose-inverse", base - pose, 0.38)
+        end
+
+        if finite(roll_pose) and math.abs(roll_pose) >= 12 and movement ~= "air" then
+            local roll_width = math.min(delta, math.abs(roll_pose))
+            local roll_side = roll_pose >= 0 and 1 or -1
+            add_candidate(candidates, "adaptive-roll-pose", base + roll_side * roll_width, 0.06)
+        end
+        local side_prior = 0.42 + (st.quality or 0) * 0.12
+        if st.layer_delta_mode == "high" then side_prior = side_prior + 0.045
+        elseif st.layer_delta_mode == "low" then side_prior = side_prior - 0.025 end
+        add_candidate(candidates, "side", base + side * delta, side_prior)
+        add_candidate(candidates, "side-inverse", base - side * delta, 0.40)
+
+        if finite(st.animation_proxy) and st.animation_proxy > 0.12
+            and movement ~= "air" then
+            local proxy_width = delta * (0.45 + clamp(st.animation_proxy, 0, 1) * 0.45)
+            add_candidate(candidates, "adaptive-animproxy", base + side * proxy_width,
+                st.animation_proxy > 0.55 and 0.14 or 0.04)
+        end
+
+        if finite(st.adaptive_trend_yaw) and finite(st.adaptive_trend_confidence)
+            and st.adaptive_trend_tick and tick - st.adaptive_trend_tick <= 2
+            and not st.alternating and not st.viera_jitter and (st.sim_quality or 1) >= 0.45 then
+            add_candidate(candidates, "adaptive-history-trend", st.adaptive_trend_yaw,
+                0.10 + clamp(st.adaptive_trend_confidence, 0, 1) * 0.08)
+        end
+
+        local miss_count = math.max(0, math.floor(tonumber(rec.miss_count) or 0))
+        local miss_phase = miss_count > 0 and (((miss_count - 1) % 12) + 1) or 0
+        if miss_phase >= 2 then
+            local phase_yaw, phase_prior
+            if miss_phase <= 8 then
+                local phase_width = miss_phase <= 2 and 0.25
+                    or miss_phase <= 4 and 0.50
+                    or miss_phase <= 6 and 0.75 or 1.0
+                local phase_side = (miss_phase % 2 == 0) and -side or side
+                phase_yaw = base + phase_side * delta * phase_width
+                phase_prior = 0.24 + miss_phase * 0.018
+            elseif miss_phase == 9 then
+                phase_yaw = finite(lby) and lby or (base + side * delta * 0.875)
+                phase_prior = 0.30
+            elseif miss_phase == 10 then
+                phase_yaw = finite(st.body_offset) and (base + st.body_offset)
+                    or (base - side * delta * 0.375)
+                phase_prior = 0.26
+            elseif miss_phase == 11 then
+                phase_yaw, phase_prior = base, 0.22
+            else
+                local velocity_offset = finite(velocity_yaw) and yaw_delta(velocity_yaw, base) or 0
+                local velocity_bound = delta * 0.625
+                phase_yaw = base + clamp(velocity_offset, -velocity_bound, velocity_bound)
+                phase_prior = 0.24
+            end
+            add_candidate(candidates, "miss-phase-" .. tostring(miss_phase),
+                phase_yaw, phase_prior)
+        end
+
+        if finite(speed) and speed >= 0.5 and speed < 18 and finite(lby)
+            and movement ~= "air" then
+            add_candidate(candidates, "micro-lby",
+                lby + side * math.min(delta * 0.35, 20), 0.18)
+        end
+
+        if finite(st.body_offset) and finite(st.body_confidence)
+            and st.body_confidence >= 0.38 and (st.body_magnitude or 0) >= 16 then
+            add_candidate(candidates, st.body_alternating and "body-delta-alternating" or "body-delta-stable",
+                base + st.body_offset, 0.30 + clamp(st.body_confidence, 0, 1) * 0.24)
+        end
+        if finite(st.cadence_anchor) and (movement == "stand" or movement == "slow") then
+            add_candidate(candidates, "lby-cadence", st.cadence_anchor, 0.56)
+        end
+        if finite(st.lby_interval) and finite(st.lby_expected_tick)
+            and (st.lby_cadence_confidence or 0) >= 0.45
+            and (movement == "stand" or movement == "slow" or movement == "duck") then
+            local until_update = st.lby_expected_tick - tick
+            if until_update >= -2 and until_update <= 5 and finite(lby) then
+                local cadence_weight = 0.38 + clamp(st.lby_cadence_confidence, 0, 1) * 0.20
+                add_candidate(candidates, "lby-periodic", lby, cadence_weight)
+            end
+        end
+        if finite(st.move_yaw) and st.move_tick and tick - st.move_tick <= 64 and
+            (movement == "stand" or movement == "slow") then
+            add_candidate(candidates, "last-move", st.move_yaw, 0.36)
+        end
+        if #st.history >= 4 and ((st.jitter or 0) > 0.45 or st.anemone_alternating) then
+            local center = finite(st.jitter_center) and st.jitter_center or base
+            local amp = clamp(st.jitter_amplitude or math.abs(yaw_delta(base, center)), 18, 55)
+
+            local phase_delta = yaw_delta(base, center)
+            local flick_alternating = st.alternating or st.anemone_alternating
+            local direction = flick_alternating and (phase_delta >= 0 and -1 or 1) or (st.side or 1)
+            add_candidate(candidates, flick_alternating and "jitter-phase" or "jitter",
+                center + direction * amp, 0.34 + st.jitter * 0.18)
+            if st.spin and finite(st.last_turn) then
+                add_candidate(candidates, "spin-predict",
+                    base + clamp(st.last_turn, -35, 35), 0.30 + st.jitter * 0.15)
+            elseif (st.spin_score or 0) > 0.70 and finite(st.spin_step) and math.abs(st.spin_step) > 10 then
+                add_candidate(candidates, "spin-step-predict",
+                    base + clamp(st.spin_step, -35, 35), 0.30 + st.jitter * 0.14)
+            end
+        end
+        if finite(st.lby_break_yaw) and st.lby_break_tick and tick - st.lby_break_tick <= 16 and
+            (movement == "stand" or movement == "slow" or movement == "duck") then
+            add_candidate(candidates, "lby-break", st.lby_break_yaw, 0.62)
+        end
+
+        local best, best_score = candidates[1], -math.huge
+        for i = 1, #candidates do
+            local c = candidates[i]
+            local score = c.prior
+
+            local plausible_limit = movement == "air" and 95
+                or (movement == "move" and 75 or 60)
+            local candidate_offset = math.abs(yaw_delta(c.yaw, base))
+            if candidate_offset > plausible_limit then score = -math.huge end
+            if c.label ~= "eye" and score > -math.huge then
+                score = score - (1 - clamp(st.quality or 0.5, 0, 1)) * 0.12
+                local evidence = clamp(tonumber(st.evidence_confidence) or 0.5, 0, 1)
+
+                if c.label == "linear-yaw-predict" or c.label == "adaptive-history-trend"
+                    or c.label == "spin-predict" or c.label == "spin-step-predict"
+                    or c.label == "jitter" or c.label == "jitter-phase" then
+                    score = score - (1 - evidence) * 0.15
+                else
+                    score = score - (1 - evidence) * 0.055
+                end
+            end
+
+            if finite(velocity_yaw) and (c.label == "move-heading" or c.label == "move-heading-reverse") then
+                local alignment = 1 - clamp(math.abs(yaw_delta(velocity_yaw, base)) / 75, 0, 1)
+                score = score + alignment * (movement == "air" and 0.20 or 0.06)
+            end
+            local candidate_stat = rec.candidates and rec.candidates[c.label] or nil
+            local bucket = c.label
+            if c.label == "pose" or c.label == "pose-inverse" or c.label == "adaptive-roll-pose"
+                or c.label == "server-yaw-rebuild" or c.label == "feet-cycle-signature"
+                or c.label == "body-delta-stable" or c.label == "body-delta-alternating" then
+                bucket = "body"
+            elseif c.label == "lby" or c.label == "lby-cadence" or c.label == "lby-periodic" or c.label == "lby-break" or c.label == "micro-lby" then
+                bucket = "lby"
+            elseif c.label == "side" or c.label == "side-inverse" or c.label:find("miss%-phase") then
+                bucket = "side"
+            elseif c.label == "move-heading" or c.label == "move-heading-reverse" or c.label == "anim-move-yaw"
+                or c.label == "adaptive-animproxy" then
+                bucket = "velocity"
+            elseif c.label == "linear-yaw-predict" or c.label == "adaptive-history-trend" or c.label == "spin-predict" or c.label == "spin-step-predict"
+                or c.label == "jitter" or c.label == "jitter-phase" then
+                bucket = "prediction"
+            end
+            local bucket_stat = rec.buckets and rec.buckets[bucket] or nil
+            local exact_hits, exact_misses, exact_streak = 0, 0, 0
+            if candidate_stat then
+                local age = math.max(0, tick - (tonumber(candidate_stat.tick) or tick))
+                local decay = 0.5 ^ (age / 128)
+                exact_hits = (tonumber(candidate_stat.hits) or 0) * decay
+                exact_misses = (tonumber(candidate_stat.misses) or 0) * decay
+                -- Streaks must age too; otherwise a stale run of misses keeps
+                -- penalizing a candidate after its actual evidence has decayed.
+                local raw_streak = math.max(0, tonumber(candidate_stat.miss_streak) or 0)
+                exact_streak = age >= 256 and 0 or math.max(0, raw_streak - math.floor(age / 32))
+            end
+            local bucket_hits, bucket_misses, bucket_streak = 0, 0, 0
+            if bucket_stat then
+                local age = math.max(0, tick - (tonumber(bucket_stat.tick) or tick))
+                local decay = 0.5 ^ (age / 128)
+                bucket_hits = (tonumber(bucket_stat.hits) or 0) * decay * 0.30
+                bucket_misses = (tonumber(bucket_stat.misses) or 0) * decay * 0.30
+                local raw_streak = math.max(0, tonumber(bucket_stat.miss_streak) or 0)
+                bucket_streak = age >= 256 and 0 or math.max(0, raw_streak - math.floor(age / 32))
+            end
+            local hits = exact_hits + bucket_hits
+            local misses = exact_misses + bucket_misses
+            local total = hits + misses
+            if total > 0 then
+
+                local accuracy = (hits + 1.25) / (total + 2.5)
+                local confidence = math.min(1, total / 7)
+                score = score + (accuracy - 0.5) * 0.34 + confidence * 0.035
+            end
+            local streak = math.max(exact_streak, bucket_streak)
+            if streak >= 2 then
+                score = score - math.min(0.16, (streak - 1) * 0.035)
+            end
+            if rec.good then
+                local good_age = tick - (tonumber(rec.good.tick) or tick)
+                if good_age >= 0 and good_age <= 128 and finite(rec.good.yaw) then
+                    local distance = math.abs(yaw_delta(c.yaw, rec.good.yaw))
+                    if distance < 42 then
+                        -- A hit is useful evidence, but should not dominate the
+                        -- selector for two seconds at full strength.
+                        local good_decay = 0.5 ^ (good_age / 48)
+                        score = score + (1 - distance / 42) * 0.46 * good_decay
+                    end
+                end
+            end
+            for j = #rec.misses, 1, -1 do
+                local miss = rec.misses[j]
+                local age = tick - miss.tick
+                if age < 0 or age > 192 then
+                    table.remove(rec.misses, j)
+                else
+                    local distance = math.abs(yaw_delta(c.yaw, miss.yaw))
+                    if distance < 44 then
+                        score = score - (miss.weight or 1) * (1 - age / 192) * (1 - distance / 44) * 1.65
+                    end
+                end
+            end
+            if score > best_score then best, best_score = c, score end
+        end
+        return best, candidates
+    end
+
+    local function set_entity_yaw(ent, yaw)
+        local wrote = false
+        local ok = pcall(function()
+            local ang = ent:get_eye_angles()
+            if ang and finite(tonumber(ang.y)) then
+                ang.y = yaw
+                ent:set_eye_angles(ang)
+                wrote = true
+            end
+        end)
+        if ok and wrote then return true end
+        local ok2, result = pcall(function()
+            ent.m_angEyeAngles.y = yaw
+            return true
+        end)
+        return ok2 and result == true
+    end
+
+    local function restore(st)
+        if not st or not st.ent or not finite(st.base_yaw) or not finite(st.last_written) then return end
+        local current = read_eye_yaw(st.ent)
+        if current and math.abs(yaw_delta(current, st.last_written)) <= 2 then
+            pcall(set_entity_yaw, st.ent, st.base_yaw)
+        end
+        st.last_written = nil
+    end
+
+    local function update()
+        if not enabled_now() then
+            if active_key then restore(memory[active_key]) end
+            active_key = nil
+            return
+        end
+        if not globals or not globals.is_connected or not globals.is_in_game then
+            if active_key then restore(memory[active_key]) end
+            active_key = nil
+            return
+        end
+        local threat
+        pcall(function() threat = entity.get_threat() end)
+        if not valid_enemy(threat) then
+            if active_key then restore(memory[active_key]) end
+            active_key = nil
+            return
+        end
+        local key = target_key(threat)
+        if not key then return end
+        if active_key and active_key ~= key then restore(memory[active_key]) end
+        active_key = key
+        local st = get_state(key)
+        st.ent = threat
+        local observed = read_eye_yaw(threat)
+        if not finite(observed) then return end
+        if not finite(st.base_yaw) then
+            st.base_yaw = observed
+        elseif not finite(st.last_written) or math.abs(yaw_delta(observed, st.last_written)) > 2 then
+            st.base_yaw = observed
+            st.last_written = nil
+        end
+        local base = st.base_yaw
+        local lby, pose = read_lby(threat), read_pose(threat)
+        local movement, delta, speed, duck, velocity_yaw, anim_side_hint,
+            anim_move_yaw, anim_activity, strafe_activity, accel_activity, simtime, roll_pose,
+            layer_delta_mode, server_yaw_hint, feet_cycle = read_motion(threat, lby)
+        st.server_yaw_hint = server_yaw_hint
+        st.server_yaw_tick = clock_tick()
+
+        -- Keep the live heading as the anchor; only blend in a stable extrapolated heading.
+        local resolver_velocity_yaw = velocity_yaw
+        if type(social_enemy_prediction) == "function" then
+            local prediction_ok, forecast = pcall(social_enemy_prediction, threat)
+            if prediction_ok and type(forecast) == "table" and forecast.velocity
+                and forecast.collision ~= true
+                and (tonumber(forecast.samples) or 0) >= 3
+                and (tonumber(forecast.divergence) or math.huge) <= 8
+                and (tonumber(forecast.acceleration) or math.huge) <= 1800 then
+                local vx, vy = tonumber(forecast.velocity.x), tonumber(forecast.velocity.y)
+                if finite(vx) and finite(vy) then
+                    local forecast_speed = math.sqrt(vx * vx + vy * vy)
+                    if speed > 35 and forecast_speed > 35 then
+                        local ratio = forecast_speed / speed
+                        if ratio < 0.55 then
+                            delta = delta * 0.88
+                        elseif ratio > 1.35 then
+                            delta = delta * 1.04
+                        end
+                        delta = clamp(delta, 20, 62)
+
+                        local predicted_yaw = norm_yaw(math.deg(math.atan2(vy, vx)))
+                        if finite(predicted_yaw) then
+                            if finite(velocity_yaw) then
+                                local heading_error = yaw_delta(predicted_yaw, velocity_yaw)
+                                local sample_confidence = clamp((forecast.samples - 2) / 6, 0, 1)
+                                local prediction_blend = 0.12 + sample_confidence * 0.23
+                                local bounded_error = clamp(heading_error, -18, 18)
+                                resolver_velocity_yaw = norm_yaw(velocity_yaw
+                                    + bounded_error * prediction_blend)
+                            else
+                                resolver_velocity_yaw = predicted_yaw
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        local tick = clock_tick()
+        sample_history(st, base, tick)
+        update_context(st, movement, speed, base, lby, pose, tick, anim_side_hint,
+            anim_activity, strafe_activity, accel_activity, delta, simtime, duck, layer_delta_mode, feet_cycle)
+        local rec = state_record(st, movement)
+        local chosen = choose_candidate(st, rec, movement, base, lby, pose, delta, tick,
+            speed, resolver_velocity_yaw, anim_move_yaw, anim_activity, roll_pose)
+        if not chosen then return end
+        st.last_candidate_yaw = chosen.yaw
+        st.last_candidate_label = chosen.label
+        st.last_candidate_state = movement
+        if math.abs(yaw_delta(observed, chosen.yaw)) > 0.5 then
+            if set_entity_yaw(threat, chosen.yaw) then
+                st.last_written = chosen.yaw
+            end
+        else
+            st.last_written = nil
+        end
+        st.last_mode = chosen.label
+        st.last_update = tick
+
+        local count = 0
+        for _ in pairs(memory) do count = count + 1 end
+        if count > max_targets then
+            local oldest_key, oldest_tick
+            for id, item in pairs(memory) do
+                if id ~= active_key and (not oldest_tick or (item.updated or 0) < oldest_tick) then
+                    oldest_key, oldest_tick = id, item.updated or 0
+                end
+            end
+            if oldest_key then memory[oldest_key] = nil end
+        end
+    end
+
+    local pending_shots, pending_sequence = {}, 0
+    local function on_fire(event)
+        if not event or event.id == nil or not event.target then return end
+        local key = target_key(event.target)
+        local st = key and memory[key] or nil
+        if not st or not finite(st.last_candidate_yaw) then return end
+
+        local now = clock_tick()
+        local candidate_tick = tonumber(st.last_update)
+        if not finite(candidate_tick) or candidate_tick > now or now - candidate_tick > 3 then
+            return
+        end
+
+        local id = tostring(event.id)
+
+        local diag_fire = shot_diag_pending[id]
+        if diag_fire then
+            local history = {}
+            local samples = type(st.history) == "table" and st.history or {}
+            local first_sample = math.max(1, #samples - 7)
+            for i = first_sample, #samples do
+                history[#history + 1] = shot_diag_number(samples[i])
+            end
+            diag_fire.resolver = {
+                candidate = shot_diag_text(st.last_candidate_label, 48),
+                candidate_yaw = shot_diag_number(st.last_candidate_yaw),
+                base_yaw = shot_diag_number(st.base_yaw),
+                side = shot_diag_number(st.side),
+                jitter = shot_diag_number(st.jitter),
+                jitter_amplitude = shot_diag_number(st.jitter_amplitude),
+                phase_confidence = shot_diag_number(st.phase_conf),
+                alternating = st.alternating == true,
+                anemone_alternating = st.anemone_alternating == true,
+                viera_jitter = st.viera_jitter == true,
+                history_quality = shot_diag_number(st.history_quality),
+                history = history
+            }
+        end
+
+        if pending_shots[id] then
+            pending_shots[id].ambiguous = true
+            return
+        end
+        pending_sequence = pending_sequence + 1
+        pending_shots[id] = {
+            key = key,
+            yaw = st.last_candidate_yaw,
+            movement = st.last_candidate_state or "stand",
+            label = st.last_candidate_label,
+            candidate_tick = candidate_tick,
+            tick = now,
+            sequence = pending_sequence,
+            ambiguous = false
+        }
+        local pending_count, oldest_id, oldest_sequence = 0, nil, nil
+        for shot_id, shot in pairs(pending_shots) do
+            pending_count = pending_count + 1
+            if now - (shot.tick or now) > 320 then
+                pending_shots[shot_id] = nil
+            elseif not oldest_sequence or (shot.sequence or 0) < oldest_sequence then
+                oldest_id, oldest_sequence = shot_id, shot.sequence or 0
+            end
+        end
+        if pending_count > 128 and oldest_id then pending_shots[oldest_id] = nil end
+    end
+
+    local function on_ack(event)
+        if not event or not event.target or event.id == nil then return end
+        local id = tostring(event.id)
+        local shot = pending_shots[id]
+        pending_shots[id] = nil
+        if not shot or shot.ambiguous or not finite(shot.yaw) then return end
+        local ack_tick = clock_tick()
+        if ack_tick < (shot.tick or ack_tick) or ack_tick - (shot.tick or ack_tick) > 320 then return end
+        local key = target_key(event.target)
+        if not key or key ~= shot.key then return end
+        local st = get_state(key)
+
+        if (shot.sequence or 0) <= (st.last_ack_sequence or 0) then return end
+        st.last_ack_sequence = shot.sequence or 0
+        local movement = shot.movement or "stand"
+        local rec = state_record(st, movement)
+        local reason = event.state
+        if reason == nil then
+            rec.good = { yaw = shot.yaw, tick = ack_tick }
+            update_candidate_feedback(rec, shot.label, true, 1, ack_tick)
+            for i = #rec.misses, 1, -1 do
+                if math.abs(yaw_delta(rec.misses[i].yaw, shot.yaw)) <= 18 then
+                    rec.misses[i].weight = (rec.misses[i].weight or 1) * 0.25
+                    if rec.misses[i].weight < 0.18 then table.remove(rec.misses, i) end
+                end
+            end
+            rec.miss_count = 0
+            return
+        end
+        reason = tostring(reason):lower()
+        if reason ~= "correction" then return end
+
+        local spread = tonumber(event.spread)
+        if finite(spread) and spread >= 1.5 then return end
+        local backtrack = tonumber(event.backtrack) or 0
+        local feedback_weight = backtrack >= 12 and 0.35
+            or backtrack >= 8 and 0.50
+            or backtrack >= 5 and 0.72 or 1.0
+
+        -- High-backtrack correction misses are weaker evidence, not zero evidence.
+        update_candidate_feedback(rec, shot.label, false, feedback_weight, ack_tick)
+        rec.miss_count = math.min(12, (rec.miss_count or 0) + 1)
+        local yaw = shot.yaw
+        local merged = false
+        for i = #rec.misses, 1, -1 do
+            local miss = rec.misses[i]
+            if clock_tick() - miss.tick > 192 then
+                table.remove(rec.misses, i)
+            elseif math.abs(yaw_delta(yaw, miss.yaw)) <= 12 then
+                miss.tick = ack_tick
+                miss.weight = clamp((miss.weight or 0.5) * 0.72 + feedback_weight * 0.8, 0.2, 2.25)
+                merged = true
+                break
+            end
+        end
+        if not merged then
+            rec.misses[#rec.misses + 1] = { yaw = yaw, tick = ack_tick, weight = feedback_weight }
+            while #rec.misses > 6 do table.remove(rec.misses, 1) end
+        end
+    end
+
+    local function reset_all()
+        if active_key then restore(memory[active_key]) end
+        memory, active_key, pending_shots = {}, nil, {}
+    end
+
+    if events.aim_fire then events.aim_fire(on_fire) end
+    events.aim_ack(on_ack)
+    events.createmove(update)
+    events.level_init(reset_all)
+    events.shutdown(reset_all)
+end
+
+do
+    local enabled=source_controls.force_shot
+    local hc=refs.rage.selection.hit_chance
+    local owned=false
+    local previous_override=nil
+    local previous_override_known=false
+    local warned=false
+    local last_command=nil
+    local function valid_target(ent)
+        local ok,value=pcall(function()
+            return ent and ent:is_valid() and ent:is_alive() and ent:is_enemy() and not ent:is_dormant()
+        end)
+        return ok and value==true
+    end
+    local function valid_vec(v)
+        return v and finite_number(tonumber(v.x)) and finite_number(tonumber(v.y)) and finite_number(tonumber(v.z))
+    end
+    local function release()
+        if not owned then
+            previous_override=nil
+            previous_override_known=false
+            return true
+        end
+
+        local read_ok, current = pcall(function() return hc:get_override() end)
+        if not read_ok then
+            return false
+        end
+
+        if current ~= 0 then
+            owned=false
+            previous_override=nil
+            previous_override_known=false
+            return true
+        end
+
+        local restore_ok = pcall(function()
+            if previous_override_known and previous_override ~= nil then
+                hc:override(previous_override)
+            else
+                hc:override()
+            end
+        end)
+        if not restore_ok then
+            return false
+        end
+
+        local verify_ok, restored = pcall(function() return hc:get_override() end)
+        if not verify_ok then
+            return false
+        end
+        if previous_override_known and previous_override ~= nil then
+            if restored ~= previous_override then return false end
+        elseif restored == 0 then
+            return false
+        end
+
+        owned=false
+        previous_override=nil
+        previous_override_known=false
+        return true
+    end
+    local function force_shot_tick(cmd)
+        if not enabled:get() or not globals.is_connected or not globals.is_in_game then
+            last_command=nil
+            release()
+            return
+        end
+        local command_number=cmd and tonumber(cmd.command_number)
+        if not command_number then release();return end
+        if last_command==command_number then return end
+        last_command=command_number
+        local ok,should_apply=pcall(function()
+            local me=entity.get_local_player()
+            local threat=entity.get_threat()
+            if not me or not me:is_alive() or not valid_target(threat) then return false end
+            if not cmd or not (cmd.in_attack==1 or cmd.in_attack==true) or cmd.in_use==1 or cmd.in_use==true then return false end
+
+            local weapon=me:get_player_weapon()
+            if not weapon then return false end
+            local next_attack=tonumber(me.m_flNextAttack) or 0
+            local next_primary=tonumber(weapon.m_flNextPrimaryAttack) or 0
+            if globals.curtime<next_attack or globals.curtime<next_primary then return false end
+            local eye=me:get_eye_position()
+            if not valid_vec(eye) then return false end
+            local best_damage=0
+            for hitbox_index=0,18 do
+                local hitbox_ok,hitbox=pcall(function() return threat:get_hitbox_position(hitbox_index) end)
+                if hitbox_ok and valid_vec(hitbox) then
+                    local trace_ok,damage,trace=pcall(utils.trace_bullet,me,eye,hitbox)
+                    if trace_ok and finite_number(tonumber(damage)) and damage>0 and trace
+                        and trace.entity==threat and not trace.start_solid and not trace.all_solid
+                        and damage>best_damage then
+                        best_damage=damage
+                    end
+                end
+            end
+            return best_damage>0
+        end)
+        if not ok or not should_apply then release();return end
+        if owned then
+            local current_ok, current_value = pcall(function() return hc:get_override() end)
+
+            if not current_ok then return end
+            if current_value == 0 then return end
+
+            owned=false
+            previous_override=nil
+            previous_override_known=false
+        end
+        if not owned then
+            local snapshot_ok, snapshot_value = pcall(function() return hc:get_override() end)
+            if not snapshot_ok then
+                if not warned then
+                    warned = true
+                    print_raw("\aA9BBFFFFsocial\a697489FF / \aC3CCDDFFForce Shot: unable to read current Hit Chance override; feature paused.")
+                end
+                return
+            end
+            previous_override_known = true
+            previous_override = snapshot_value
+        end
+        local applied=pcall(function() hc:override(0) end)
+        if applied then owned=true end
+        local verified=false
+        if applied then
+            local vok,value=pcall(function() return hc:get_override() end)
+            verified=vok and value==0
+        end
+        if not verified then
+            release()
+            if not warned then
+                warned=true
+                print_raw("\aA9BBFFFFsocial\a697489FF / \aC3CCDDFFForce Shot: Hit Chance override could not be verified; feature paused.")
+            end
+        else
+            warned = false
+        end
+    end
+    events.createmove(force_shot_tick)
+    events.shutdown(function() last_command=nil;release() end)
+    events.level_init(function() last_command=nil;release() end)
+end
+
+do
     local extrap=source_controls.extrap
     local force=source_controls.force
-    local state={armed=false,hook=nil,attached=false,attach_unknown=false,broken=false,extrap_interval=nil,extrap_applied_at=0,predict_guard=0}
+    local state={armed=false,hook=nil,attached=false,attach_unknown=false,broken=false,next_attach_retry=0,extrap_interval=nil,extrap_applied_at=0}
     local messages={}
     local function warn(key,msg)
         if messages[key]~=msg then messages[key]=msg;print_raw("\aA9BBFFFFsocial\a697489FF / \aC3CCDDFF"..msg)end
     end
-    local function finite(n)return type(n)=="number" and n==n and math.abs(n)<math.huge end
+    local finite = finite_number
     local function live()
-        if not globals.is_connected or not globals.is_in_game then return false end
-        local p=entity.get_local_player()
-        return p~=nil and p:is_alive()
+        local ok, result = pcall(function()
+            if not globals.is_connected or not globals.is_in_game then return false end
+            local p=entity.get_local_player()
+            return p~=nil and p:is_alive()
+        end)
+        return ok and result == true
     end
     local function cvar_slot(name,method)
         return {name=name,method=method,owned=false}
@@ -4566,16 +7100,24 @@ do
         if current==nil then return false end
         if slot.last~=nil and not close(current,slot.last) then
 
-            slot.owned=false;slot.original=nil;return true
+            slot.owned=false;slot.original=nil;slot.last=nil;slot.force=nil;return true
         end
         local ok,after=put(slot,slot.original,slot.force)
         if not ok then
             if after~=nil then slot.last=after end
             return false
         end
-        slot.owned=false;slot.original=nil;slot.last=nil;return true
+        slot.owned=false;slot.original=nil;slot.last=nil;slot.force=nil;return true
     end
     local function own_write(slot,value,force_write)
+        if slot.owned then
+            local current=read(slot)
+            if current==nil then return false end
+
+            if slot.last~=nil and not close(current,slot.last) then
+                slot.owned=false;slot.original=nil;slot.last=nil
+            end
+        end
         if not slot.owned then
             local original=read(slot)
             if original==nil then return false end
@@ -4589,7 +7131,6 @@ do
         return ok
     end
     local band={cvar_slot("cl_interpolate","int"),cvar_slot("cl_interp_ratio","int"),cvar_slot("cl_interp","float")}
-    local prediction=cvar_slot("cl_predictweapons","int")
     local function stop_extrap()
         local ok=true
         for _,slot in ipairs(band)do if not restore(slot)then ok=false end end
@@ -4601,11 +7142,33 @@ do
         if not extrap:get() or not live()then stop_extrap();return end
         local interval=tonumber(globals.tickinterval)
         if not finite(interval) or interval<=0 then warn("tickinterval","Invalid tickinterval; extrapolation paused.");stop_extrap();return end
-        interval=math.clamp(interval,1/128,1/32)
+        if interval<1/256 or interval>1/16 then
+            warn("tickinterval-range","Unsupported tick interval; extrapolation paused.")
+            stop_extrap()
+            return
+        end
 
-        local now=tonumber(globals.realtime) or 0
-        if state.extrap_interval==interval and now-state.extrap_applied_at<1 then return end
+        local now=tonumber(globals.realtime)
+        if not finite(now) then
+            warn("realtime", "Invalid realtime clock; extrapolation paused.")
+            stop_extrap()
+            return
+        end
+        messages["tickinterval"]=nil
+        messages["tickinterval-range"]=nil
+        messages["realtime"]=nil
         local targets={1,1,interval}
+        local unchanged = state.extrap_interval == interval and now-state.extrap_applied_at < 1
+        if unchanged then
+            for i,slot in ipairs(band) do
+                local current = read(slot)
+                if current == nil or not close(current, targets[i]) then
+                    unchanged = false
+                    break
+                end
+            end
+        end
+        if unchanged then return end
         for i,slot in ipairs(band)do
             if not own_write(slot,targets[i],false)then
                 stop_extrap()
@@ -4617,10 +7180,10 @@ do
     end
     local function detach()
         if state.hook and (state.attached or state.attach_unknown)then
-            local ok,err=pcall(state.hook.detach,state.hook)
-            if not ok then
+            local ok,result=pcall(state.hook.detach,state.hook)
+            if not ok or result == false then
                 state.attach_unknown=true
-                warn("detach","CRITICAL: Force hook detach failed. Keep this Lua loaded, disable the feature and restart the game: "..tostring(err))
+                warn("detach","CRITICAL: Force hook detach failed. Keep this Lua loaded, disable the feature and restart the game: "..tostring(result))
 
                 return false
             end
@@ -4629,11 +7192,12 @@ do
         return true
     end
     local function stop_force()
-        local detached=detach()
-        local restored=restore(prediction)
-        state.predict_guard=0
-        if not restored then warn("restore-predict","cl_predictweapons restoration pending.")end
-        return detached and restored
+        local detached = detach()
+        if detached then
+            state.attached = false
+            state.attach_unknown = false
+        end
+        return detached
     end
     local function setup_hook()
         if state.hook then return not state.attach_unknown end
@@ -4652,19 +7216,25 @@ do
                     return a~=nil and b~=nil and me~=nil and entity.get(a)==me
                 end)
                 if not checked then warn("callback","Force entity lookup failed: "..tostring(skip))end
-                if checked and skip then state.last_time=globals.realtime;return end
+                if checked and skip then return end
                 return original:get_original(a,b)
             end)
 
+            local hook_api_ok,attach_fn,detach_fn=pcall(function() return hook.attach,hook.detach end)
+            if not hook_api_ok or type(attach_fn)~="function" or type(detach_fn)~="function" then
+                error("Starsync hook object is incomplete")
+            end
             state.hook=hook;state.attach_unknown=true
-            local detached,err=pcall(hook.detach,hook)
-            if not detached then error("initial detach failed: "..tostring(err))end
+            local detached,result=pcall(hook.detach,hook)
+            if not detached or result == false then
+                error("initial detach failed: "..tostring(result))
+            end
             state.attach_unknown=false
             return hook
         end)
         if not ok then
             state.broken=true
-            warn("setup","Force Interpolation setup failed: "..tostring(result))
+            warn("setup","Interpolation setup failed: "..tostring(result))
             stop_force()
 
             return false
@@ -4676,32 +7246,50 @@ do
             stop_force()
             return
         end
+        local now=tonumber(globals.realtime) or 0
+        if now < (state.next_attach_retry or 0) then return end
         if not setup_hook()then return end
         if not state.attached then
-            local ok,err=pcall(state.hook.attach,state.hook)
-            if not ok then
-                state.attach_unknown=true;state.broken=true
-                warn("attach","Force hook attach failed: "..tostring(err));stop_force();return
+            local ok,result=pcall(state.hook.attach,state.hook)
+            if not ok or result == false then
+                state.attach_unknown=true
+                warn("attach","Force hook attach failed: "..tostring(result))
+
+                if stop_force() then
+                    state.broken=false
+                    state.next_attach_retry=now+1.5
+                else
+                    state.broken=true
+                end
+                return
             end
             state.attached=true
+            state.attach_unknown=false
+            state.broken=false
+            state.next_attach_retry=0
+            messages["attach"]=nil
+            messages["setup"]=nil
 
         end
-        local now=tonumber(globals.realtime)
-        if not finite(now) or now-state.predict_guard<1 then return end
-        state.predict_guard=now
-        local current=read(prediction)
-        if current==nil then return end
-        if current~=0 and not own_write(prediction,0,true)then stop_force();state.broken=true end
+
     end
     local function guard(key,fn)
         local ok,err=pcall(fn)
         if not ok then warn(key,tostring(err))end
     end
-    extrap:set_callback(function()guard("extrap-toggle",function()if not extrap:get()then stop_extrap()end end)end)
+    extrap:set_callback(function()guard("extrap-toggle",function()
+        if not extrap:get() then
+            local restored = stop_extrap()
+            if restored then
+                messages["read:cl_interpolate"] = nil
+                messages["read:cl_interp_ratio"] = nil
+                messages["read:cl_interp"] = nil
+            end
+        end
+    end)end)
     force:set_callback(function()guard("force-toggle",function()
         if force:get() then
-            state.armed=true;state.broken=false
-            warn("risk","Force Interpolation: native Starsync hook enabled.")
+            state.armed=true;state.broken=false;state.next_attach_retry=0
             tick_force()
         else
             state.armed=false
@@ -4712,1099 +7300,113 @@ do
     events.render(function()guard("lifecycle",function()if not live()then stop_extrap();stop_force()end end)end)
     events.level_init(function()guard("map",function()
         local a,b=stop_extrap(),stop_force()
-        state.armed=force:get() and b;state.broken=not b
+        state.armed=force:get() and b
+        state.broken=not b
+        if a then messages["map-extrap"]=nil end
+        if b then
+            messages["detach"]=nil
+            messages["attach"]=nil
+            messages["setup"]=nil
+        end
         if not a then warn("map-extrap","Extrapolation cvar restoration still pending after map change.")end
     end)end)
     events.shutdown(function()guard("shutdown",function()
         local a,b=stop_extrap(),stop_force()
-        if not a or not b then warn("unload","CRITICAL: source-module cleanup incomplete. Restart the game before further testing.")end
+        if not a or not b then warn("unload","CRITICAL: interpolation hook or cvar cleanup incomplete. Restart the game before further testing.")end
     end)end)
 end
 
 do
     function aa_patch.wall()
-        local player=entity.get_local_player()
-        if not player or not player:is_alive() or entity.get_threat() then aa_patch.wall_cache=nil;return end
-        if bit.band(player.m_fFlags,1)==0 then aa_patch.wall_cache=nil;return end
-        local origin=player:get_eye_position()
-        local tick=globals.tickcount
-        local cache=aa_patch.wall_cache
-        if cache and tick>=cache.tick and tick-cache.tick<4 and (origin-cache.origin):length()<8 then return cache.yaw end
-        local best,best_yaw=64,nil
-        local distances={}
-        for i=0,23 do
-            local yaw=i*15
-            local tr=utils.trace_line(origin,origin+vector():angles(0,yaw)*80,player,nil,1)
-            if tr and not tr.start_solid and not tr.all_solid and type(tr.fraction)=="number" and tr.fraction>0 and tr.fraction<.8 then
-                local distance=tr.fraction*80
-                distances[i]=distance
-                if distance<best then best,best_yaw=distance,yaw end
-            end
-        end
-        if cache and cache.yaw and best_yaw then
-            local old=distances[math.floor(cache.yaw/15+.5)%24]
-            if old and old<=best+5 then best_yaw=cache.yaw end
-        end
-        aa_patch.wall_cache={tick=tick,origin=origin:clone(),yaw=best_yaw}
-        return best_yaw
-    end
-end
-
-do
-    local state = {
-        last_cmd = nil,
-        last_enemy = nil,
-        last_trigger_time = 0,
-        air_last_tick = nil
-    }
-    local warned = nil
-    local process_ticks = source_controls.process_ticks
-
-    local function reset()
-        local restored = process_ticks.end_override(true)
-        if not restored and warned ~= "ticks" then
-            warned = "ticks"
-            print_raw("[social] Auto LC: sv_maxusrcmdprocessticks could not be restored; keep the script loaded and retry.")
-        end
-        state.last_cmd = nil
-        state.last_enemy = nil
-        state.air_last_tick = nil
-        state.last_trigger_time = 0
-        source_controls.lc_status = "waiting"
-        if refs.rage.main.double_tap_fake_lag_limit then
-            refs.rage.main.double_tap_fake_lag_limit:override()
-        end
-    end
-
-    local function get_hittable_enemy()
-        local ok, enemy = pcall(entity.get_threat, true)
-        if not ok or enemy == nil then return nil end
-        local valid, result = pcall(function()
-            return enemy:is_player()
-                and enemy:is_enemy()
-                and enemy:is_alive()
-                and not enemy:is_dormant()
-        end)
-        if not valid or not result then return nil end
-        return enemy
-    end
-
-    local function trigger(enemy)
-        if not process_ticks.begin_override() then
-            source_controls.lc_status = "tick cvar unavailable"
-            return false
-        end
-
-        local ok, err = pcall(function()
-            rage.exploit:force_teleport()
-            rage.exploit:force_charge()
-        end)
-        if not ok then
-            if warned ~= tostring(err) then
-                warned = tostring(err)
-                print_raw("[social] Auto LC: " .. tostring(err))
-            end
-            source_controls.lc_status = "error"
-            return false
-        end
-
-        state.last_trigger_time = globals.realtime
-        local ok_index, index = pcall(function() return enemy:get_index() end)
-        state.last_enemy = ok_index and index or nil
-        source_controls.lc_status = "active"
-        return true
-    end
-
-    local function air_teleport_weapon_allowed(weapon)
-        local selected = source_controls.lc_weapons;
-        if not selected then return true end
-        local ok_index, index = pcall(function() return weapon:get_weapon_index() end);
-        local key = ok_index and ({[9] = "AWP", [31] = "Taser", [40] = "SSG 08"})[index] or nil;
-        if key == nil then
-            local ok_name, name = pcall(function() return weapon:get_name() end);
-            if not ok_name then return false end
-            if name == "AWP" then key = "AWP"
-            elseif name == "SSG 08" then key = "SSG 08"
-            elseif name == "Taser" or name == "Zeus x27" then key = "Taser"
-            else return false end
-        end
-        local ok_selected, value = pcall(function() return selected:get(key) end);
-        return ok_selected and value == true;
-    end
-
-    local function command_is_firing(cmd, player)
-        local firing = cmd and (
-            cmd.in_attack == true or cmd.in_attack == 1 or
-            cmd.in_attack2 == true or cmd.in_attack2 == 1
-        ) or false
-        if firing then return true end
-        local last_shot
-        pcall(function()
-            local weapon = player:get_player_weapon()
-            last_shot = weapon and tonumber(weapon.m_fLastShotTime or weapon:get_prop("m_fLastShotTime"))
-        end)
-        if finite_number(last_shot) then
-            local age = (tonumber(globals.curtime) or 0) - last_shot
-            return age >= 0 and age < 0.12
-        end
-        return false
-    end
-
-    local function run_air_teleport(cmd, player, anim_state, weapon, mode)
-        if mode == "On enemy" then
-            if not refs.rage.main.double_tap:get() then
-                source_controls.lc_status = "DT disabled"
-                return
-            end
-            if command_is_firing(cmd, player) then
-                source_controls.lc_status = "shot protected"
-                return
-            end
-            if rage.exploit:get() ~= 1 then
-                source_controls.lc_status = "waiting DT charge"
-                return
-            end
-            if not air_teleport_weapon_allowed(weapon) then
-                source_controls.lc_status = "weapon filtered"
-                return
-            end
-            if cmd and cmd.in_jump and not source_controls.lc_on_cross:get() then return end
-
-            local eye = player:get_eye_position()
-            local velocity = player.m_vecVelocity
-            if not eye or not velocity then return end
-            local interval = tonumber(globals.tickinterval)
-            if not finite_number(interval) or interval <= 0 then return end
-            local current_tick = tonumber(globals.tickcount)
-            if not finite_number(current_tick) or state.air_last_tick == current_tick then return end
-            state.air_last_tick = current_tick
-
-            -- Use the current threat rather than tracing every enemy. The old all-player,
-            -- 7-horizon x 4-hitbox scan was expensive enough to tank FPS with DT enabled.
-            local enemy = get_hittable_enemy()
-            if not enemy then
-                source_controls.lc_status = "no threat"
-                return
-            end
-            local enemy_velocity = enemy.m_vecVelocity
-            if not enemy_velocity then return end
-
-            local points = {}
-            for _, hitbox_id in ipairs({0, 2, 5}) do
-                local point = enemy:get_hitbox_position(hitbox_id)
-                if point then points[#points + 1] = point end
-            end
-            if #points == 0 then return end
-
-            local found, best_horizon = false, nil
-            -- Three horizons and three representative hitboxes: at most 9 bullet traces
-            -- instead of up to 28 per enemy per command. Stop at the first valid window.
-            for _, horizon in ipairs({0, 2, 4}) do
-                local dt = interval * horizon
-                local predicted_eye = eye:clone()
-                predicted_eye.x = predicted_eye.x + velocity.x * dt
-                predicted_eye.y = predicted_eye.y + velocity.y * dt
-                predicted_eye.z = predicted_eye.z + velocity.z * dt
-                for _, base_point in ipairs(points) do
-                    local predicted_point = base_point:clone()
-                    predicted_point.x = predicted_point.x + enemy_velocity.x * dt
-                    predicted_point.y = predicted_point.y + enemy_velocity.y * dt
-                    predicted_point.z = predicted_point.z + enemy_velocity.z * dt
-                    local ok, damage, trace = pcall(utils.trace_bullet, player, predicted_eye, predicted_point)
-                    if ok and tonumber(damage) and damage > 10 and trace and trace.entity == enemy then
-                        found, best_horizon = true, horizon
-                        break
-                    end
-                end
-                if found then break end
-            end
-
-            if not found then
-                source_controls.lc_status = "no predicted window"
-                return
-            end
-
-            local now = tonumber(globals.realtime) or 0
-            local cooldown = (now - (tonumber(state.last_trigger_time) or 0)) >= 0.075
-            if cooldown then
-                local ok = trigger(enemy)
-                if not ok then
-                    -- A failed cvar override must not silently suppress the native teleport.
-                    pcall(function() rage.exploit:force_teleport() end)
-                end
-            else
-                source_controls.lc_status = "re-arming"
-            end
-            if best_horizon == 0 then
-                source_controls.lc_status = cooldown and "air teleport" or "re-arming"
-            else
-                source_controls.lc_status = cooldown and ("peek t+" .. tostring(best_horizon)) or "re-arming"
-            end
-            return
-        end
-
-        if mode == "Exploit" then
-            local lag_limit = refs.rage.main.double_tap_fake_lag_limit
-            if lag_limit then lag_limit:override() end
-            local ok_info, info = pcall(function() return weapon:get_weapon_info() end)
-            if not ok_info or not info or info.weapon_type == 9 then return end
-
-            local tick = tonumber(globals.tickcount)
-            if not finite_number(tick) or not cmd then return end
-            local ticks = math.max(10, math.min(30, math.floor(tonumber(source_controls.lc_exploit_ticks:get()) or 10)))
-            if rage.exploit:get() ~= 1 or tick % ticks ~= 0 then
-                rage.exploit:force_charge()
-            else
-                cmd.force_defensive = true
-                if lag_limit then lag_limit:override(math.random(7)) end
-                rage.exploit:force_teleport()
-                state.air_last_tick = globals.tickcount
-                source_controls.lc_status = "air exploit"
-            end
-        end
-    end
-
-    function aa_patch.lc(cmd, owner, actual_state, hidden)
-        process_ticks.end_override(false)
-
-        if not source_controls.lc_enabled or not source_controls.lc_enabled:get() then
-            source_controls.lc_status = "off"
-            state.last_enemy = nil
-            process_ticks.end_override(true)
-            if refs.rage.main.double_tap_fake_lag_limit then
-                refs.rage.main.double_tap_fake_lag_limit:override()
-            end
-            return
-        end
-
         local player = entity.get_local_player()
         if not player or not player:is_alive() then
-            reset()
-            return
+            aa_patch.wall_cache = nil
+            return nil
         end
 
-        local command_id = cmd and cmd.command_number or globals.tickcount
-        if state.last_cmd == command_id then return end
-        state.last_cmd = command_id
+        local origin = player:get_eye_position()
+        if not origin then return nil end
 
-        local mode = source_controls.lc_mode:get()
-        if mode ~= "Exploit" and refs.rage.main.double_tap_fake_lag_limit then
-            refs.rage.main.double_tap_fake_lag_limit:override()
-        end
-        local flags = tonumber(player.m_fFlags)
-        local anim_state = player:get_anim_state()
-        local weapon = player:get_player_weapon()
-        if mode == "On enemy" or mode == "Exploit" then
-            if flags == nil or bit.band(flags, 1) ~= 0 or not anim_state or not weapon then
-                state.last_enemy = nil
-                source_controls.lc_status = "waiting"
-                if refs.rage.main.double_tap_fake_lag_limit then
-                    refs.rage.main.double_tap_fake_lag_limit:override()
-                end
-                return
-            end
-            source_controls.lc_status = "waiting"
-            local ok, err = pcall(run_air_teleport, cmd, player, anim_state, weapon, mode)
-            if not ok and warned ~= tostring(err) then
-                warned = tostring(err)
-                print_raw("[social] Auto LC: " .. tostring(err))
-                source_controls.lc_status = "error"
-            end
-            return
-        end
+        local tick = tonumber(globals.tickcount) or 0
+        local now = tonumber(globals.realtime) or 0
+        local cache = aa_patch.wall_cache
+        local moved = cache and (origin - cache.origin):length() or math.huge
+        local cache_fresh = cache and now >= (cache.time or now)
+            and now - (cache.time or now) <= 0.42 and moved <= 88
 
-        if flags == nil then
-            state.last_enemy = nil
-            source_controls.lc_status = "waiting"
-            return
-        end
-        local in_air = bit.band(flags, 1) == 0
-        local is_crouching = bit.band(flags, 2) ~= 0
-        if not in_air or not is_crouching then
-            state.last_enemy = nil
-            source_controls.lc_status = "waiting"
-            return
-        end
-
-        local enemy = get_hittable_enemy()
-        if not enemy then
-            state.last_enemy = nil
-            source_controls.lc_status = "not hittable"
-            return
-        end
-        trigger(enemy)
-    end
-
-    events.render(function()
-        local player = entity.get_local_player()
-        if not player or not player:is_alive() then reset() end
-    end)
-    events.level_init(reset)
-    events.shutdown(reset)
-end
-
--- Exploit Backtrack: Anemone baseline policy, with ground-only activation.
--- Conservative target is approximately 105 ms total (measured latency + native Fake Latency).
--- This trades some artificial delay for more reliable shot registration; it is not record rewriting.
-do
-    local ref = refs.misc.main.other.fake_latency
-    local owned, applied = false, nil
-    local function release()
-        if owned and ref then
-            local ok, current = pcall(function() return ref:get_override() end)
-            if ok and current == applied then pcall(function() ref:override() end) end
-        end
-        owned, applied = false, nil
-        source_controls.exploit_backtrack_status = "off"
-    end
-    local function update(cmd)
-        if not source_controls.exploit_backtrack or not source_controls.exploit_backtrack:get() or not ref then
-            release(); return
-        end
-        local player = entity.get_local_player()
-        if not player or not player:is_alive() then release(); return end
-        local flags = tonumber(player.m_fFlags) or 0
-        local grounded = bit.band(flags, 1) ~= 0
-        if not grounded then release(); source_controls.exploit_backtrack_status = "airborne"; return end
-        local measured = 0
-        pcall(function()
-            local channel = utils.net_channel()
-            if channel and channel.latency then measured = (tonumber(channel.latency[0]) or 0) * 1000 end
-        end)
-        local shot_flying = cmd and (cmd.in_attack == true or cmd.in_attack == 1 or cmd.in_attack2 == true or cmd.in_attack2 == 1) or false
-        if not shot_flying then
-            pcall(function()
-                local weapon = player:get_player_weapon()
-                local last_shot = weapon and tonumber(weapon.m_fLastShotTime or weapon:get_prop("m_fLastShotTime"))
-                if finite_number(last_shot) then shot_flying = ((tonumber(globals.curtime) or 0)-last_shot) < 0.10 end
-            end)
-        end
-        if shot_flying then
-            source_controls.exploit_backtrack_status = "shot"
-            return
-        end
-        local current_ok, current = pcall(function() return ref:get_override() end)
-        if owned and current_ok and current ~= applied then
-            owned, applied = false, nil
-            source_controls.exploit_backtrack_status = "external override"
-            return
-        end
-        if not owned and (not current_ok or current ~= nil) then
-            source_controls.exploit_backtrack_status = "control busy"
-            return
-        end
-        local desired = math.floor(math.max(0, math.min(100, 105 - measured)) + 0.5)
-        local set_ok = pcall(function() ref:override(desired) end)
-        if set_ok then
-            owned, applied = true, desired
-            source_controls.exploit_backtrack_status = "grounded"
-        end
-    end
-    events.createmove(update)
-    events.render(function()
-        if not source_controls.exploit_backtrack or not source_controls.exploit_backtrack:get() then release() end
-    end)
-    events.level_init(release)
-    events.shutdown(release)
-end
-
--- Adaptive Fake Lags: Anemone state/distance/shot/desync policy, adapted to social refs.
--- Normal cycle ticks are randomized from 10..14; hit/shot flushes and rare troughs stay short.
-do
-    local fl = refs.antiaim.fake_lag
-    local self = {
-        owned = {}, values = {},
-        fake_lag_roll = 0, fake_lag_state = nil,
-        fake_lag_limit = 12, fake_lag_var = 4,
-        last_health = nil, hit_flush = 0,
-        last_lag_roll = nil, aimed_hold = 0,
-        last_tickbase = nil, desync_ticks = 0,
-        shot_flying = false, shoot_lag = nil
-    }
-    local function read_override(ref)
-        if not ref then return false, nil end
-        return pcall(function() return ref:get_override() end)
-    end
-    local function release()
-        for key, ref in pairs({enabled=fl.enabled, limit=fl.limit, variability=fl.variability}) do
-            if self.owned[key] and ref then
-                local ok, current = read_override(ref)
-                if ok and current == self.values[key] then pcall(function() ref:override() end) end
-            end
-            self.owned[key], self.values[key] = false, nil
-        end
-        self.last_health, self.hit_flush = nil, 0
-        self.fake_lag_roll, self.fake_lag_state = 0, nil
-        self.last_tickbase, self.desync_ticks = nil, 0
-        self.shot_flying, self.shoot_lag = false, nil
-    end
-    local function set_owned(key, ref, value)
-        if not ref then return end
-        local ok, current = read_override(ref)
-        if self.owned[key] and ok and current ~= self.values[key] then
-            self.owned[key], self.values[key] = false, nil
-        end
-        if self.owned[key] or (ok and current == nil) then
-            local success = pcall(function() ref:override(value) end)
-            if success then self.owned[key], self.values[key] = true, value end
-        end
-    end
-    local function local_state(me, speed)
-        local flags = tonumber(me.m_fFlags) or 1
-        local on_ground = bit.band(flags, 1) ~= 0
-        local ducked = bit.band(flags, 2) ~= 0
-        local fake_duck, double_tap, hide_shots, slow_walk = false, false, false, false
-        pcall(function() fake_duck = refs.antiaim.misc.fake_duck:get() == true end)
-        pcall(function() double_tap = refs.rage.main.double_tap:get() == true end)
-        pcall(function() hide_shots = refs.rage.main.hide_shots:get() == true end)
-        pcall(function() slow_walk = refs.antiaim.misc.slow_walk:get() == true end)
-        if not fake_duck and not double_tap and not hide_shots then return "Fake lag", speed, on_ground, ducked, false end
-        if (self.ground_ticks or 0) > 5 then
-            if fake_duck and not ducked then return "Fake duck", speed, on_ground, ducked, true end
-            if speed > 5 then return slow_walk and "Walk" or (ducked and "Crawl" or "Run"), speed, on_ground, ducked, true end
-            return ducked and "Duck" or "Stand", speed, on_ground, ducked, true
-        end
-        return ducked and "Air duck" or "Air", speed, on_ground, ducked, true
-    end
-    local function update_shot_state(cmd, me)
-        local weapon, last_shot
-        pcall(function() weapon = me:get_player_weapon() end)
-        if weapon then pcall(function() last_shot = weapon.m_fLastShotTime or weapon:get_prop("m_fLastShotTime") end) end
-        local flying = cmd and ((cmd.in_attack == true or cmd.in_attack == 1) or (cmd.in_attack2 == true or cmd.in_attack2 == 1)) or false
-        if not flying and finite_number(tonumber(last_shot)) then
-            flying = ((tonumber(globals.curtime) or 0) - tonumber(last_shot)) < 0.10
-        end
-        self.shot_flying = flying
-        local tickbase
-        pcall(function() tickbase = tonumber(me.m_nTickBase) end)
-        if tickbase then
-            if self.last_tickbase and math.abs(tickbase - self.last_tickbase) > 64 then self.last_tickbase = nil end
-            if self.last_tickbase and tickbase < self.last_tickbase then
-                self.desync_ticks = math.min(14, math.max(0, self.last_tickbase - tickbase - 1))
-            else
-                self.desync_ticks = 0
-            end
-            self.last_tickbase = tickbase
-        end
-    end
-    local function update(cmd)
-        if not source_controls.adaptive_fakelags or not source_controls.adaptive_fakelags:get() then release(); return end
-        local me = entity.get_local_player()
-        if not me or not me:is_alive() then release(); return end
-        local velocity, speed = me.m_vecVelocity, 0
-        pcall(function() if velocity then speed = velocity:length2d() end end)
-        update_shot_state(cmd, me)
-        local flags = tonumber(me.m_fFlags) or 1
-        local on_ground = bit.band(flags, 1) ~= 0
-        self.ground_ticks = on_ground and ((self.ground_ticks or 0) + 1) or 0
-        local state, _, _, ducked, exploit = local_state(me, speed)
-        local in_air = state == "Air" or state == "Air duck"
-        local threat, distance = nil, 1000
-        pcall(function() threat = entity.get_threat() end)
-        if threat then
-            pcall(function()
-                local a, b = me:get_eye_position(), threat:get_eye_position()
-                if a and b then
-                    local dx, dy, dz = a.x-b.x, a.y-b.y, a.z-b.z
-                    distance = math.sqrt(dx*dx + dy*dy + dz*dz)
-                end
-            end)
-        end
-        local health = tonumber(me.m_iHealth) or 100
-        if self.last_health and health < self.last_health then self.hit_flush = math.random(4, 8) end
-        self.last_health = health
-        local hit_flush_active = (self.hit_flush or 0) > 0
-
-        self.fake_lag_roll = (self.fake_lag_roll or 0) - 1
-        if self.fake_lag_state ~= state then
-            self.fake_lag_state, self.fake_lag_roll = state, 0
-        end
-        if (self.hit_flush or 0) > 0 then
-            self.hit_flush = self.hit_flush - 1
-            self.fake_lag_limit, self.fake_lag_var = 1, 0
-        elseif self.fake_lag_roll <= 0 and not self.shot_flying then
-            local far = math.max(0, math.min(1, (distance - 200) / 1200))
-            local base = math.floor(10 + far * 4 + (in_air and 1 or 0) + (ducked and 1 or 0))
-            if state == "Fake lag" then base = math.max(10, math.min(13, base)) end
-            if exploit then base = math.max(10, base - 1) end
-            if threat then
-                pcall(function()
-                    local their_eye, our_eye, angles = threat:get_eye_position(), me:get_eye_position(), threat.m_angEyeAngles
-                    if their_eye and our_eye and angles then
-                        local target_yaw = tonumber(angles.y)
-                        if target_yaw then
-                            local yaw_to_us = math.deg(math.atan2(our_eye.y-their_eye.y, our_eye.x-their_eye.x))
-                            local delta = ((yaw_to_us-target_yaw+180)%360)-180
-                            self.aimed_hold = math.abs(delta) < 25 and 5 or math.max(0, (self.aimed_hold or 0)-1)
-                            if (self.aimed_hold or 0) > 0 then base = math.min(14, base + 1) end
-                        end
+        local hits = {}
+        local seen = {}
+        for yaw = -180, 165, 15 do
+            local direction = vector():angles(0, yaw)
+            local nearest_distance
+            for _, radius in ipairs({96, 128}) do
+                local trace = utils.trace_line(origin, origin + direction * radius, player, nil, 1)
+                if trace and not trace.start_solid and not trace.all_solid
+                    and type(trace.fraction) == "number"
+                    and trace.fraction > 0.01 and trace.fraction < 0.42
+                    and trace.entity and trace.entity:get_index() == 0 then
+                    local distance = trace.fraction * radius
+                    if not nearest_distance or distance < nearest_distance then
+                        nearest_distance = distance
                     end
-                end)
-            end
-            local trough = math.random(0, 5) == 0
-            local spike = (not trough and math.random(0, 4) == 0) and math.random(1, 3) or 0
-            if trough then
-                self.fake_lag_limit, self.fake_lag_var = math.random(1, 2), math.random(0, 5)
-            else
-                self.fake_lag_limit = math.max(10, math.min(14, base + math.random(-2, 2) + spike))
-                local desync = tonumber(self.desync_ticks) or 0
-                local variability_base = math.max(in_air and desync + 5 or desync, math.random(3, 9))
-                self.fake_lag_var = math.max(0, math.min(15, variability_base + math.random(-2, 4)))
-            end
-            local roll, guard = math.random(4, 15), 6
-            while guard > 0 and self.last_lag_roll and math.abs(roll-self.last_lag_roll) <= 1 do
-                roll, guard = math.random(4, 15), guard-1
-            end
-            self.last_lag_roll, self.fake_lag_roll = roll, roll
-        end
-
-        local limit = tonumber(self.fake_lag_limit) or 12
-        local variability = tonumber(self.fake_lag_var) or 4
-        if limit >= 10 then
-            if speed > 120 then limit = math.max(10, math.min(14, limit-2))
-            elseif speed > 3 then limit = math.max(10, math.min(14, limit-1)) end
-        end
-        if self.shot_flying then
-            if not self.shoot_lag then self.shoot_lag = math.max(1, math.min(5, limit-6)) end
-            limit, variability = self.shoot_lag, 0
-        else
-            self.shoot_lag = nil
-        end
-        if hit_flush_active then limit, variability = 1, 0 end
-        if variability > 0 and math.random(0, 2) == 0 then variability = math.random(0, math.min(15, variability+4)) end
-        set_owned("enabled", fl.enabled, true)
-        set_owned("limit", fl.limit, math.max(1, math.min(14, limit)))
-        set_owned("variability", fl.variability, math.max(0, math.min(15, variability)))
-    end
-    events.createmove(update)
-    events.render(function()
-        if not source_controls.adaptive_fakelags or not source_controls.adaptive_fakelags:get() then release() end
-    end)
-    events.level_init(release)
-    events.shutdown(release)
-end
-
-
--- Predict Exploit Uncharge: Anemone timing policy + social-native observations.
--- Uses observed simulation timing and predicted visible peek windows; never forces attack.
-do
-    local timing = {}
-    local records = {}
-    local local_tb = nil
-    local last_command = nil
-    local auto_seen, auto_cooldown = nil, 0
-    local accuracy_owned, accuracy_values = {}, {}
-    local status = "off"
-
-    local function finite(v) return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge end
-    local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
-    local function bool_ref(ref)
-        local ok, value = pcall(function() return ref and ref:get() end)
-        return ok and value == true
-    end
-    local function read_sim(ent)
-        local sim
-        pcall(function()
-            sim = ent:get_simulation_time()
-            if type(sim) == "table" then sim = sim.current end
-            sim = tonumber(sim)
-            if not finite(sim) then sim = tonumber(ent.m_flSimulationTime) end
-        end)
-        return finite(sim) and sim or nil
-    end
-    local function read_yaw(ent)
-        local yaw
-        pcall(function()
-            local a = ent.m_angEyeAngles
-            yaw = a and tonumber(a.y)
-        end)
-        if not finite(yaw) then
-            pcall(function()
-                local a = ent:get_eye_angles()
-                yaw = a and tonumber(a.y)
-            end)
-        end
-        return finite(yaw) and ((yaw + 180) % 360 - 180) or 0
-    end
-    local function read_shot(ent)
-        local value
-        pcall(function()
-            local w = ent:get_player_weapon()
-            if w then value = tonumber(w.m_fLastShotTime or w:get_prop("m_fLastShotTime")) end
-        end)
-        return finite(value) and value or nil
-    end
-    local function new_timing()
-        return {status="warmup", confidence=0, samples=0, burst_votes=0, pulse_events={}, cadence_conf=0, generation=1}
-    end
-    local function update_timing(st, sample)
-        local function norm(x) return (x + 180) % 360 - 180 end
-        if not finite(sample.tick) or not finite(sample.sim) then return st, "invalid" end
-        if st.tick and (sample.tick < st.tick or sample.tick-st.tick > 128 or (st.uid and sample.uid and st.uid ~= sample.uid) or (st.state and sample.state and st.state ~= sample.state)) then
-            local generation = (st.generation or 1) + 1
-            st = new_timing(); st.generation = generation
-        end
-        if st.tick == sample.tick then return st, "duplicate" end
-        if not st.tick then
-            st.tick, st.sim, st.uid, st.state = sample.tick, sample.sim, sample.uid, sample.state
-            st.yaw, st.baseline, st.quiet, st.shot, st.sim_frontier = sample.yaw, sample.yaw, 0, sample.shot, sample.sim
-            return st, "warmup"
-        end
-        local arrival, advance = sample.tick-st.tick, sample.sim-st.sim
-        local previous_sim = st.sim
-        st.advance, st.arrival = advance, arrival
-        st.tick, st.uid, st.state = sample.tick, sample.uid, sample.state
-        if finite(sample.shot) and sample.shot > 0 then
-            if finite(st.shot) and sample.shot > st.shot then st.shot_until = sample.tick+2 end
-            st.shot = sample.shot
-        end
-        if advance == 0 then
-            st.stall = (st.stall or 0) + arrival
-            if st.stall > 8 then st.status, st.confidence = "stale", 0 end
-            return st, "stalled"
-        end
-        local gap = (st.stall or 0) + arrival
-        st.stall = 0
-        st.sim, st.samples = sample.sim, (st.samples or 0)+1
-        st.sim_frontier = math.max(st.sim_frontier or previous_sim, sample.sim)
-        local event = "normal"
-        if advance < -1 and advance >= -22 then
-            st.status, st.confidence = "rollback_evidence", 0.80
-            st.risk_until, st.burst_until = sample.tick+3, nil
-            event = "rollback"
-        elseif advance < -22 or advance > 64 then
-            local generation = (st.generation or 1)+1
-            st = new_timing(); st.generation = generation
-            st.tick, st.sim, st.uid, st.state = sample.tick, sample.sim, sample.uid, sample.state
-            st.yaw, st.baseline, st.sim_frontier = sample.yaw, sample.yaw, sample.sim
-            return st, "reset"
-        else
-            local excess = advance-gap
-            st.excess, st.advance, st.arrival = excess, advance, gap
-            if st.samples >= 3 and gap <= 3 and excess >= 3 and excess <= 22 then
-                st.burst_votes = math.min(3, (st.burst_votes or 0)+1)
-                st.status, st.confidence = "burst_evidence", 0.45+0.15*st.burst_votes
-                st.burst_until, st.risk_until = sample.tick+2, nil
-                event = "burst"
-            elseif gap >= 4 and math.abs(excess) <= 2 then
-                st.status, st.confidence = "choke_release", 0.20
-                st.burst_until = nil
-                event = "choke_release"
-            elseif not st.risk_until or sample.tick >= st.risk_until then
-                st.status, st.confidence = "normal", 0
-                st.burst_votes = math.max(0, (st.burst_votes or 0)-0.10)
-            end
-        end
-        if finite(sample.yaw) then
-            local yaw, pending = norm(sample.yaw), st.pending
-            if pending then
-                local age = sample.sim-pending.sim
-                if age > 0 and age <= 4 and math.abs(norm(yaw-pending.base)) <= 15 and pending.delta*norm(yaw-pending.snap) < 0 then
-                    local events = st.pulse_events
-                    events[#events+1] = pending.sim
-                    if #events > 7 then table.remove(events, 1) end
-                    st.baseline = norm(pending.base+norm(yaw-pending.base)*0.35)
-                    st.pulse_until = sample.tick+1
-                    local intervals = {}
-                    for i=2,#events do local d=events[i]-events[i-1]; if d>=2 and d<=40 then intervals[#intervals+1]=d end end
-                    table.sort(intervals)
-                    local period = #intervals>0 and intervals[math.ceil(#intervals/2)] or 0
-                    local good = 0
-                    for i=1,#intervals do if math.abs(intervals[i]-period)<=1 then good=good+1 end end
-                    st.period, st.cadence_conf = period, (#intervals>=3 and good/#intervals or 0)
-                    st.last_pulse, st.pending = pending.sim, nil
-                    event = "pulse_recovery"
-                elseif age < 0 or age > 4 or math.abs(norm(yaw-pending.base)) > 35 then st.pending = nil end
-            end
-            if not st.pending and finite(st.yaw) and advance>0 and advance<=3 then
-                local jump = norm(yaw-st.yaw)
-                if math.abs(jump)>=28 and (st.quiet or 0)>=2 then
-                    st.pending = {sim=sample.sim, base=st.yaw, snap=yaw, delta=jump}
-                    st.pulse_until = sample.tick+2
-                    event = "pulse_snap"
                 end
-                if math.abs(jump)<=9 then
-                    st.quiet = math.min(8, (st.quiet or 0)+1)
-                    if not st.pending then st.baseline = yaw end
-                else st.quiet = 0 end
             end
-            st.yaw = yaw
+            if nearest_distance and not seen[yaw] then
+                seen[yaw] = true
+                hits[#hits + 1] = { yaw = yaw, distance = nearest_distance }
+            end
         end
-        return st, event
-    end
-    local function timing_decision(st, tick)
-        if not st or not finite(tick) or not st.tick or tick<st.tick or tick-st.tick>8 or (st.stall or 0)>8 then
-            return {status="stale", confidence=0, force_send=false}
-        end
-        local defensive = st.risk_until and tick<st.risk_until or false
-        local burst = st.burst_until and tick<st.burst_until or false
-        local pulse = st.pulse_until and tick<st.pulse_until or false
-        local forecast = false
-        if st.cadence_conf>=0.80 and st.period and st.period>=2 and st.last_pulse then
-            local phase = st.sim+(tick-st.tick)-st.last_pulse
-            forecast = phase>=st.period-1 and phase<=st.period+1
-        end
-        return {status=st.status, confidence=st.confidence or 0, defensive=defensive, burst=burst, pulse=pulse,
-            forecast=forecast, force_send=defensive or (burst and (st.confidence or 0)>=0.70) or pulse,
-            period=st.period, cadence_conf=st.cadence_conf,
-            evidence=(burst and st.shot_until and tick<st.shot_until) and "burst_with_observed_shot" or (defensive and "simulation_rollback" or (burst and "excess_simulation_advance" or "none"))}
-    end
-    local function sample_observations()
-        if not source_controls.predict_uncharge or not source_controls.predict_uncharge:get() or not globals.is_in_game then
-            timing, records = {}, {}
-            return
-        end
-        local tick, iv = tonumber(globals.tickcount), tonumber(globals.tickinterval)
-        if not finite(tick) or not finite(iv) or iv<=0 then return end
-        local ok, players = pcall(entity.get_players, true)
-        if not ok or type(players)~="table" then return end
-        local present = {}
-        for _, ent in pairs(players) do
-            local got, data = pcall(function()
-                if not ent:is_alive() or ent:is_dormant() then return nil end
-                local id = ent:get_index()
-                local info = ent:get_player_info()
-                local sim = read_sim(ent)
-                local origin = ent:get_origin()
-                local vel = ent.m_vecVelocity
-                if not id or not info or not finite(sim) or not origin or not vel then return nil end
-                local vx, vy, vz = tonumber(vel.x), tonumber(vel.y), tonumber(vel.z)
-                local x, y, z = tonumber(origin.x), tonumber(origin.y), tonumber(origin.z)
-                if not finite(vx) or not finite(vy) or not finite(vz) or not finite(x) or not finite(y) or not finite(z) then return nil end
-                local flags = tonumber(ent.m_fFlags) or 0
-                return {id=id, uid=tonumber(info.userid), sim=sim, sim_tick=math.floor(sim/iv+0.5), tick=tick,
-                    x=x,y=y,z=z,vx=vx,vy=vy,vz=vz, yaw=read_yaw(ent), shot=read_shot(ent),
-                    state=(bit.band(flags,1)~=0 and "ground" or "air")}
-            end)
-            if got and data and data.uid then
-                present[data.id] = true
-                local st = timing[data.id] or new_timing()
-                local old_generation = st.generation
-                st = update_timing(st, {tick=data.tick, sim=data.sim_tick, uid=data.uid, state=data.state, yaw=data.yaw, shot=data.shot})
-                timing[data.id] = st
-                local rec = records[data.id]
-                if not rec or rec.uid~=data.uid or data.tick<rec.tick then
-                    rec = {uid=data.uid, samples={}, events={}, quality=0.35, status="warmup", horizon=1, gap_ticks=1}
-                    records[data.id] = rec
-                end
-                rec.tick = data.tick
-                local prev = rec.last
-                if not prev then
-                    rec.last = data
-                    rec.quality, rec.status, rec.horizon = 0.35, "warmup", 1
-                elseif data.sim == prev.sim then
-                    -- A changing payload at the same simulation time is not fresh evidence.
-                    local moved = math.sqrt((data.x-prev.x)^2+(data.y-prev.y)^2+(data.z-prev.z)^2)
-                    if moved > 0.5 then rec.quality, rec.status, rec.horizon = math.min(rec.quality or 1, 0.5), "same-simulation payload changed", 1 end
-                else
-                    local ds = data.sim-prev.sim
-                    local quality, why, horizon = 1, "fresh", 15
-                    if ds < -iv*0.5 then
-                        quality, why, horizon = 0, "rollback/catchup", 1
-                        rec.ax, rec.ay, rec.az = 0, 0, 0
-                    elseif ds <= 0 then
-                        quality, why, horizon = 0, "non-advancing simulation", 1
-                        rec.ax, rec.ay, rec.az = 0, 0, 0
-                    elseif ds > 0.5 then
-                        quality, why, horizon = 0.25, "gap reset", 1
-                        rec.ax, rec.ay, rec.az = 0, 0, 0
-                        rec.events = {}
-                    else
-                        local dx,dy,dz = data.x-prev.x,data.y-prev.y,data.z-prev.z
-                        local dvx,dvy,dvz = data.vx-prev.vx,data.vy-prev.vy,data.vz-prev.vz
-                        local ax,ay,az = clamp(dvx/ds,-1200,1200),clamp(dvy/ds,-1200,1200),clamp(dvz/ds,-1200,1200)
-                        rec.ax = (tonumber(rec.ax) or ax)*0.35 + ax*0.65
-                        rec.ay = (tonumber(rec.ay) or ay)*0.35 + ay*0.65
-                        rec.az = (tonumber(rec.az) or az)*0.35 + az*0.65
-                        rec.accel_tick = data.tick
-                        local accel = math.sqrt(dvx*dvx+dvy*dvy+dvz*dvz)/ds
-                        local ex = dx-(data.vx+prev.vx)*0.5*ds
-                        local ey = dy-(data.vy+prev.vy)*0.5*ds
-                        local ez = dz-(data.vz+prev.vz)*0.5*ds
-                        local residual = math.sqrt(ex*ex+ey*ey+ez*ez)
-                        horizon = clamp(math.floor(math.sqrt(16/math.max(accel,1))/iv),1,15)
-                        quality = clamp(1-residual/32,0,1)
-                        if dx*dx+dy*dy+dz*dz>4096 then quality,why,horizon=0,"position discontinuity",1
-                        elseif residual>16 then why,horizon="movement mismatch",1 end
-                        local gap = math.floor(ds/iv+0.5)
-                        rec.gap_ticks = gap
-                        if gap>=14 and finite(data.shot) and finite(prev.shot) and data.shot>prev.shot and data.shot<=data.sim+iv then
-                            rec.events[#rec.events+1] = data.tick
-                            if #rec.events>4 then table.remove(rec.events,1) end
-                            rec.last_burst, rec.evidence = data.tick, "simulation gap + observed shot"
-                            quality, horizon = math.min(quality,0.5), math.min(horizon,2)
-                        end
+
+        local best_yaw, best_score
+        if #hits >= 2 then
+            for i = 1, #hits do
+                local a = hits[i]
+                local b = hits[i % #hits + 1]
+                local gap = math.abs(math.normalize_yaw(b.yaw - a.yaw))
+                if gap <= 30 then
+                    local mid_yaw = math.normalize_yaw(a.yaw + math.normalize_yaw(b.yaw - a.yaw) * 0.5)
+                    local candidate = math.normalize_yaw(mid_yaw + 180)
+                    local score = math.min(a.distance, b.distance) + gap * 0.12
+                    if cache_fresh and cache.yaw then
+                        local continuity = math.abs(math.normalize_yaw(candidate - cache.yaw))
+                        score = score + continuity * 0.22
                     end
-                    rec.last, rec.quality, rec.status, rec.horizon = data, quality, why, horizon
+                    if not best_score or score < best_score then
+                        best_score, best_yaw = score, candidate
+                    end
                 end
             end
         end
-        for id in pairs(timing) do if not present[id] then timing[id]=nil; records[id]=nil end end
-        for id in pairs(records) do if not present[id] then records[id]=nil end end
-    end
-    local function assessment(id, uid, tick, iv)
-        local rec = records[id]
-        if not rec or rec.uid~=uid or not rec.last then return nil end
-        local age = tick-(tonumber(rec.last.tick) or tick)
-        local budget = clamp(math.ceil(0.03125/iv)+(rec.gap_ticks or 1)+2,4,16)
-        local stale = age<0 or age>budget
-        local invalid = (rec.quality or 0)==0 or stale
-        local expected, anticipated = false, false
-        if #rec.events>=4 then
-            local intervals={}
-            for i=2,#rec.events do intervals[#intervals+1]=rec.events[i]-rec.events[i-1] end
-            table.sort(intervals)
-            local period=intervals[math.ceil(#intervals/2)]
-            local spread=intervals[#intervals]-intervals[1]
-            if period>=8 and period<=128 and spread<=2 then
-                expected=rec.events[#rec.events]+period
-                anticipated=tick>=expected-1 and tick<=expected+1
+
+        if not best_yaw and cache_fresh and cache.yaw then
+            cache.tick = tick
+            return cache.yaw
+        end
+
+        if not best_yaw and #hits > 0 and not cache_fresh then
+            local nearest = hits[1]
+            for i = 2, #hits do
+                if hits[i].distance < nearest.distance then nearest = hits[i] end
+            end
+            best_yaw = math.normalize_yaw(nearest.yaw + 180)
+        end
+
+        if best_yaw and cache_fresh and cache.yaw then
+            local delta = math.abs(math.normalize_yaw(best_yaw - cache.yaw))
+
+            if delta < 28 then
+                best_yaw = math.normalize_yaw(cache.yaw + math.normalize_yaw(best_yaw - cache.yaw) * 0.25)
             end
         end
-        return {quality=stale and 0 or rec.quality, invalid=invalid,
-            status=stale and "expired observed record" or rec.status,
-            horizon=rec.horizon, age=age, budget=budget, sim=rec.last.sim,
-            evidence=rec.evidence, anticipated=anticipated, next_window=expected,
-            force_send=invalid or (rec.last_burst and tick-rec.last_burst<=2) or anticipated}
-    end
-    local function policy(decision, shared, observed, tick)
-        if not shared or not observed or not finite(tick) then return nil,"waiting for observations" end
-        if not finite(observed.tick) or tick<observed.tick or tick-observed.tick>2 then return nil,"waiting for fresh evidence" end
-        if decision.defensive and (decision.confidence or 0)>=0.75 and decision.evidence=="simulation_rollback" then
-            return "fresh simulation rollback", "rollback:"..tostring(observed.generation)..":"..tostring(observed.risk_until)
-        end
-        if decision.burst and (decision.confidence or 0)>=0.75 and decision.evidence=="burst_with_observed_shot" and not shared.invalid then
-            return "verified excess advance + observed shot", "burst:"..tostring(observed.generation)..":"..tostring(observed.burst_until)
-        end
-        if shared.anticipated and not shared.invalid and shared.quality>=0.75 and finite(shared.next_window) then
-            return "recurring observed gap/shot window", "window:"..tostring(shared.next_window)
-        end
-        return nil, shared.invalid and "waiting for valid fresh record" or "observing; no substantiated window"
-    end
-    local function read_number_method(obj, name)
-        local value
-        pcall(function() value = obj[name](obj) end)
-        if type(value)=="table" then
-            local x,y = tonumber(value.x), tonumber(value.y)
-            if finite(x) and finite(y) then value = math.sqrt(x*x+y*y) else value=nil end
-        end
-        value = tonumber(value)
-        return finite(value) and value or nil
-    end
-    local function read_accuracy(ref, ref_key, desired)
-        if not ref then return end
-        local ok,current = pcall(function() return ref:get_override() end)
-        if accuracy_owned[ref_key] and ok and current~=accuracy_values[ref_key] then
-            accuracy_owned[ref_key], accuracy_values[ref_key] = false, nil
-        end
-        if accuracy_owned[ref_key] or (ok and current==nil) then
-            local set_ok = pcall(function() ref:override(desired) end)
-            if set_ok then accuracy_owned[ref_key], accuracy_values[ref_key] = true, desired end
-        end
-    end
-    local function release_accuracy()
-        local refs_to_restore = {
-            hc=refs.rage.selection.hit_chance,
-            head=refs.rage.selection.multipoint_scale and refs.rage.selection.multipoint_scale[1],
-            body=refs.rage.selection.multipoint_scale and refs.rage.selection.multipoint_scale[2]
+
+        aa_patch.wall_cache = {
+            tick = tick,
+            time = now,
+            origin = origin:clone(),
+            yaw = best_yaw or (cache_fresh and cache.yaw or nil)
         }
-        for key, ref in pairs(refs_to_restore) do
-            if accuracy_owned[key] and ref then
-                local ok,current=pcall(function() return ref:get_override() end)
-                if ok and current==accuracy_values[key] then pcall(function() ref:override() end) end
-            end
-            accuracy_owned[key],accuracy_values[key]=false,nil
-        end
+        return aa_patch.wall_cache.yaw
     end
-    local function peek_prediction(me, enemy, iv)
-        local eye, weapon = me:get_eye_position(), me:get_player_weapon()
-        if not eye or not weapon then return nil end
-        local velocity = enemy.m_vecVelocity
-        if not velocity then return nil end
-        local info = enemy:get_player_info()
-        local rec = info and records[enemy:get_index()] or nil
-        local use_accel = rec and rec.uid==tonumber(info.userid) and rec.quality and rec.quality>=0.5
-            and finite(rec.accel_tick) and (tonumber(globals.tickcount)-rec.accel_tick)<=2
-        local ax = use_accel and clamp(tonumber(rec.ax) or 0,-1200,1200) or 0
-        local ay = use_accel and clamp(tonumber(rec.ay) or 0,-1200,1200) or 0
-        local az = use_accel and clamp(tonumber(rec.az) or 0,-1200,1200) or 0
-        local hitboxes = {0,2,5}
-        local points = {}
-        for _,hb in ipairs(hitboxes) do
-            local p = enemy:get_hitbox_position(hb)
-            if p then points[#points+1]=p end
-        end
-        if #points==0 then return nil end
-        local best = nil
-        -- Check near-term peek windows first; the old 9 x 4 scan ran 36 bullet
-        -- traces per command even while DT was charging. This caps it at 15.
-        for _,horizon in ipairs({0,1,2,4,6}) do
-            local dt=iv*horizon
-            for _,base in ipairs(points) do
-                local p=base:clone()
-                p.x=p.x+(tonumber(velocity.x) or 0)*dt+0.5*ax*dt*dt
-                p.y=p.y+(tonumber(velocity.y) or 0)*dt+0.5*ay*dt*dt
-                p.z=p.z+(tonumber(velocity.z) or 0)*dt+0.5*az*dt*dt
-                local ok,damage,tr=pcall(utils.trace_bullet,me,eye,p)
-                if ok and finite(tonumber(damage)) and damage>10 and tr and tr.entity==enemy then
-                    best={horizon=horizon,damage=damage,point=p}
-                    return best
-                end
-            end
-        end
-        return best
-    end
-    local function apply_stationary_accuracy(me, enemy, peek)
-        if not peek then release_accuracy(); return end
-        local flags=tonumber(me.m_fFlags) or 0
-        local grounded=bit.band(flags,1)~=0
-        local vel=me.m_vecVelocity
-        local speed=0
-        pcall(function() if vel then speed=vel:length2d() end end)
-        if not grounded or speed>3 then release_accuracy(); return end
-        local weapon=me:get_player_weapon()
-        if not weapon then release_accuracy(); return end
-        local inaccuracy=read_number_method(weapon,"get_inaccuracy") or 0
-        local spread=read_number_method(weapon,"get_spread") or 0
-        local dispersion=math.max(0,inaccuracy+spread)
-        local accuracy=clamp(1-dispersion*14,0,1)
-        -- Stationary-only force-shot assistance: lower HC as spread rises and widen MP.
-        local hc=math.floor(clamp(42+accuracy*20,42,62)+0.5)
-        local head=math.floor(clamp(84+(1-accuracy)*16,84,100)+0.5)
-        local body=math.floor(clamp(76+(1-accuracy)*18,76,94)+0.5)
-        read_accuracy(refs.rage.selection.hit_chance,"hc",hc)
-        if refs.rage.selection.multipoint_scale then
-            read_accuracy(refs.rage.selection.multipoint_scale[1],"head",head)
-            read_accuracy(refs.rage.selection.multipoint_scale[2],"body",body)
-        end
-    end
-    local function local_timing_update(cmd)
-        local me=entity.get_local_player()
-        if not me then return nil end
-        local tb=tonumber(me.m_nTickBase)
-        local seq=cmd and tonumber(cmd.command_number)
-        local uid
-        pcall(function() local info=me:get_player_info(); uid=info and tonumber(info.userid) end)
-        if not finite(tb) or not finite(seq) then return nil end
-        if not local_tb or seq<local_tb.sequence or (uid and local_tb.uid~=uid) then
-            local_tb={uid=uid,tb=tb,frontier=tb,delta=0,tick=globals.tickcount,sequence=seq,status="warmup"}
-        elseif seq~=local_tb.sequence then
-            local_tb.delta=tb-local_tb.tb
-            local_tb.tb=tb
-            local_tb.frontier=math.max(local_tb.frontier or tb,tb)
-            local_tb.tick=globals.tickcount
-            local_tb.sequence=seq
-            local_tb.status=tb<(local_tb.frontier or tb)-1 and "local rollback" or (local_tb.delta>=14 and "local burst" or "normal")
-        end
-        return local_tb
-    end
-    local function update(cmd)
-        if not source_controls.predict_uncharge or not source_controls.predict_uncharge:get() then
-            status="off"; source_controls.predict_uncharge_status=status
-            auto_seen,auto_cooldown,last_command=nil,0,nil
-            release_accuracy()
-            return
-        end
-        if not cmd then return end
-        local seq=tonumber(cmd.command_number)
-        if not finite(seq) then status="command identity unavailable"; source_controls.predict_uncharge_status=status; return end
-        if last_command==seq then return end
-        if last_command and seq<last_command then auto_seen,auto_cooldown=nil,0 end
-        last_command=seq
-        if not globals.is_in_game or not bool_ref(refs.rage.main.double_tap) then
-            status="Double Tap / live Rage context unavailable"
-            source_controls.predict_uncharge_status=status
-            release_accuracy()
-            return
-        end
-        local me=entity.get_local_player()
-        if not me or not me:is_alive() then
-            status="local player unavailable"; source_controls.predict_uncharge_status=status; release_accuracy(); return
-        end
-        local enemy
-        pcall(function() enemy=entity.get_threat() end)
-        if not enemy or not enemy:is_player() or not enemy:is_enemy() or not enemy:is_alive() or enemy:is_dormant() then
-            status="no live threat"; source_controls.predict_uncharge_status=status; release_accuracy(); return
-        end
-        local info=enemy:get_player_info()
-        local uid=info and tonumber(info.userid)
-        local index=enemy:get_index()
-        local tick,iv=tonumber(globals.tickcount),tonumber(globals.tickinterval)
-        if not uid or not finite(tick) or not finite(iv) or iv<=0 then
-            status="target identity / tick interval unavailable"; source_controls.predict_uncharge_status=status; release_accuracy(); return
-        end
-        local observed=timing[index]
-        local shared=assessment(index,uid,tick,iv)
-        local reason,key
-        if observed and observed.uid==uid and shared then
-            local decision=timing_decision(observed,tick)
-            reason,key=policy(decision,shared,observed,tick)
-        else
-            key="observed timing warming up"
-        end
-        local charge
-        pcall(function() charge=tonumber(rage.exploit:get()) end)
-        -- Prediction traces are useful only at a charged DT window. Avoid spending
-        -- command time forecasting shots while the exploit is still recharging.
-        local peek=(finite(charge) and charge>=0.99) and peek_prediction(me,enemy,iv) or nil
-        apply_stationary_accuracy(me,enemy,(peek and peek.horizon<=3) and peek or nil)
-        local peek_reason,peek_key
-        if peek and peek.horizon<=3 then
-            peek_reason="predicted visible peek t+"..tostring(peek.horizon)
-            peek_key="peek:"..tostring(uid)..":"..tostring(tick-peek.horizon)
-        end
-        if not reason and peek_reason then reason,key=peek_reason,peek_key end
-        if not reason then status=key or "observing; no substantiated window"; source_controls.predict_uncharge_status=status; return end
-
-        local local_state=local_timing_update(cmd)
-        local busy=(local_state and (local_state.status=="local rollback" or local_state.status=="local burst"))
-            or not finite(charge) or (charge<0.99)
-        local action=(cmd.in_attack==true or cmd.in_attack==1 or cmd.in_attack2==true or cmd.in_attack2==1
-            or cmd.in_use==true or cmd.in_use==1 or cmd.in_reload==true or cmd.in_reload==1)
-        local native_busy=bool_ref(refs.antiaim.misc.fake_duck) or bool_ref(refs.rage.main.hide_shots)
-        if busy or action or native_busy then
-            status="window observed; preserving local exploit/action"
-            source_controls.predict_uncharge_status=status
-            return
-        end
-        key=tostring(uid)..":"..tostring(key)
-        if auto_seen==key or tick<(auto_cooldown or 0) then
-            status="window observed; duplicate/cooldown"
-            source_controls.predict_uncharge_status=status
-            return
-        end
-        cmd.send_packet,cmd.no_choke=true,true
-        auto_seen,auto_cooldown=key,tick+4
-        status="auto flush: "..reason
-        source_controls.predict_uncharge_status=status
-    end
-    local function reset()
-        timing,records={},{}
-        local_tb=nil
-        auto_seen,auto_cooldown,last_command=nil,0,nil
-        release_accuracy()
-        status="waiting"
-        source_controls.predict_uncharge_status=status
-    end
-    events.net_update_end(function()
-        local ok, err = pcall(sample_observations)
-        if not ok then source_controls.predict_uncharge_status = "observation error" end
-    end)
-    events.createmove(function(cmd)
-        local ok, err = pcall(update, cmd)
-        if not ok then
-            status = "prediction error"
-            source_controls.predict_uncharge_status = status
-            pcall(release_accuracy)
-        end
-    end)
-    events.render(function()
-        local me=entity.get_local_player()
-        if not me or not me:is_alive() then release_accuracy() end
-        if not source_controls.predict_uncharge or not source_controls.predict_uncharge:get() then release_accuracy() end
-    end)
-    events.level_init(reset)
-    events.shutdown(reset)
 end
 
 do
@@ -6201,8 +7803,10 @@ do
             end
         end
     end
-    local last_error=nil
-    events.render(function()local ok,err=pcall(draw);if not ok then release();if last_error~=tostring(err) then last_error=tostring(err);print_raw("\aA9BBFFFFsocial\a697489FF / \aEAA5B1FFwindows\aC3CCDDFF  "..tostring(err)) end end end)
+    events.render(function()
+        local ok = pcall(draw)
+        if not ok then release() end
+    end)
     events.shutdown(release)
 
 end
@@ -6861,9 +8465,20 @@ do
         end
     end)
     events.level_init(function()markers={}end)
-    local failure=nil
     events.render(function()
-        local ok,err=pcall(draw)
-        if not ok and failure~=tostring(err) then failure=tostring(err);print_raw("\aA9BBFFFFsocial\a697489FF / \aEAA5B1FFvisuals\aC3CCDDFF  "..failure) end
+        pcall(draw)
     end)
 end
+local dt123 = ui.find("Aimbot", "Ragebot", "Main", "Double Tap")
+local lss = ui.find("Aimbot", "Ragebot", "Main", "Double Tap", "Lag Options")
+
+local last_true_time = 0
+events.createmove(function(cmd)
+    if rage.exploit:get() == 0 then
+        last_true_time = globals.curtime
+    end
+
+    if globals.curtime - last_true_time < 0.1 and dt123:get() and lss:get() ~= "Disabled" then
+        cmd.force_defensive = true
+    end
+end)
