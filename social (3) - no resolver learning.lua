@@ -5299,15 +5299,19 @@ do
         az = math.clamp(az, -1800, 1200)
         return vector(vx, vy, vz), ax, ay, az
     end
+    local function reset_sample_history(entry, sample)
+        entry.samples = { sample }
+        entry.good = 1
+        entry.prediction = nil
+        entry.history_epoch = (tonumber(entry.history_epoch) or 0) + 1
+    end
     local function push_sample(entry, sample)
         entry.samples = entry.samples or {}
         local samples = entry.samples
         local last = samples[#samples]
-        local changed = false
         if last then
             if sample.sim < last.sim - 0.0005 then
-                entry.samples = { sample }
-                entry.good = 1
+                reset_sample_history(entry, sample)
                 return true
             elseif math.abs(sample.sim - last.sim) <= 0.0005 then
                 local moved = vec_dist(sample.origin, last.origin)
@@ -5316,7 +5320,9 @@ do
                     samples[#samples] = sample
                     return false
                 end
-                samples[#samples] = sample
+                -- A materially different observation at the same simulation time
+                -- cannot safely be combined with the older velocity history.
+                reset_sample_history(entry, sample)
                 return true
             else
                 local dt = sample.sim - last.sim
@@ -5325,19 +5331,19 @@ do
                 local plausible = dt <= 0.40
                     and distance <= math.max(48, math.min(120, last.speed * dt + 40))
                     and velocity_delta <= math.max(220, 1500 * dt)
-                changed = plausible
+                if not plausible then
+                    -- Keep the observation only as a fresh baseline; do not let it
+                    -- contaminate velocity estimation from the previous history.
+                    reset_sample_history(entry, sample)
+                    return false
+                end
             end
-        else
-            changed = true
         end
+        samples = entry.samples
         samples[#samples + 1] = sample
         while #samples > 12 do table.remove(samples, 1) end
-        if changed then
-            entry.good = math.min(16, (entry.good or 0) + 1)
-        else
-            entry.good = math.max(0, (entry.good or 0) - 1)
-        end
-        return changed
+        entry.good = math.min(16, (entry.good or 0) + 1)
+        return true
     end
     local function observe_enemies()
         local observe_time = tonumber(globals.realtime)
@@ -5578,7 +5584,8 @@ do
             speed = speed,
             planar_speed = planar_speed,
             time = tonumber(globals.realtime) or 0,
-            id = id
+            id = id,
+            history_epoch = tonumber(entry.history_epoch) or 0
         }
         entry.prediction = result
         status = string.format("enemy prediction %.1ft / conf %.2f / div %.1f", ticks_float, confidence, divergence)
@@ -5591,7 +5598,8 @@ do
         if not entry or not entry.prediction then return nil end
         local p = entry.prediction
         local age = (tonumber(globals.realtime) or 0) - (tonumber(p.time) or -math.huge)
-        if p.id ~= id or age < 0 or age > 0.16 or not vec_ok(p.origin)
+        if p.id ~= id or (tonumber(p.history_epoch) or 0) ~= (tonumber(entry.history_epoch) or 0)
+            or age < 0 or age > 0.16 or not vec_ok(p.origin)
             or not vec_ok(p.live_origin) or not vec_ok(p.velocity)
             or not finite(tonumber(p.divergence)) or not finite(tonumber(p.velocity_change))
             or not finite(tonumber(p.acceleration)) then return nil end
